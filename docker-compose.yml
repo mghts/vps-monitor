@@ -1,0 +1,40 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-vps_monitor}
+      POSTGRES_USER: ${POSTGRES_USER:-vps_monitor}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    volumes:
+      - ./postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-vps_monitor} -d ${POSTGRES_DB:-vps_monitor}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  server:
+    image: ${SERVER_IMAGE:?set SERVER_IMAGE in .env}
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-vps_monitor}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-vps_monitor}
+      SETUP_TOKEN: ${SETUP_TOKEN:?set SETUP_TOKEN in .env}
+      BASE_URL: ${BASE_URL:?set BASE_URL in .env}
+      BIND_ADDR: 0.0.0.0:8080
+      STATIC_DIR: /app/web/dist
+      AGENT_IMAGE: ${AGENT_IMAGE:-vps-monitor-agent:latest}
+      AGENT_INSTALLER_URL: ${AGENT_INSTALLER_URL:-}
+      AGENT_RELEASE_REPOSITORY: ${AGENT_RELEASE_REPOSITORY:-}
+      AGENT_RELEASE_TAG: ${AGENT_RELEASE_TAG:-}
+      GEOIP_MMDB_PATH: ${GEOIP_MMDB_PATH:-/data/GeoLite2-City.mmdb}
+      BACKGROUND_DIR: ${BACKGROUND_DIR:-/data/backgrounds}
+      COOKIE_SECURE: ${COOKIE_SECURE:-true}
+      RUST_LOG: ${RUST_LOG:-info}
+    ports:
+      - "${SERVER_PORT:-8080}:8080"
+    volumes:
+      - ./data:/data

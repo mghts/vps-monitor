@@ -1,0 +1,16 @@
+services:
+  agent:
+    image: ${AGENT_IMAGE:-vps-monitor-agent:latest}
+    container_name: vps-monitor-agent
+    restart: unless-stopped
+    network_mode: host
+    pid: host
+    cap_add:
+      - NET_RAW
+    volumes:
+      - /:/host:ro
+    environment:
+      VPS_MONITOR_SERVER_URL: ${VPS_MONITOR_SERVER_URL:?set VPS_MONITOR_SERVER_URL}
+      VPS_MONITOR_AGENT_TOKEN: ${VPS_MONITOR_AGENT_TOKEN:?set VPS_MONITOR_AGENT_TOKEN}
+      VPS_MONITOR_HOST_ROOT: /host
+
