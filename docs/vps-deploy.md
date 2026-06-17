@@ -17,7 +17,122 @@
 
 ## 1. 准备镜像
 
-你需要先把两个镜像推到 Docker Hub。
+你需要先把两个镜像发布到 Docker Hub：
+
+- `<你的 DockerHub 用户名>/vps-monitor-server:v0.1.0`
+- `<你的 DockerHub 用户名>/vps-monitor-agent:v0.1.0`
+
+Docker Hub 的账号、仓库和 Access Token 需要你自己创建。原因很简单：这是你的账号凭据，不能写进项目，也不应该交给别人保管。你创建好 token 后，GitHub Actions 会自动帮你构建并推送镜像。
+
+### 推荐方式：GitHub Actions 自动发布
+
+这种方式最省心，也最不容易再遇到 `exec format error`，因为 workflow 会一次性构建 `linux/amd64` 和 `linux/arm64` 两种镜像。
+
+#### 1.1 在 Docker Hub 创建仓库
+
+打开 Docker Hub，进入 `Repositories`，创建两个公开仓库：
+
+```text
+vps-monitor-server
+vps-monitor-agent
+```
+
+假设你的 Docker Hub 用户名是 `alice`，那么最终镜像名就是：
+
+```text
+alice/vps-monitor-server:v0.1.0
+alice/vps-monitor-agent:v0.1.0
+```
+
+仓库建议设为 `Public`。如果你设为 `Private`，中心端 VPS 和各个 Agent VPS 拉取镜像前都需要先 `docker login`，部署会麻烦很多。
+
+#### 1.2 创建 Docker Hub Access Token
+
+在 Docker Hub：
+
+1. 点击右上角头像。
+2. 进入 `Account settings`。
+3. 找到 `Personal access tokens`。
+4. 创建新 token，例如命名为 `github-vps-monitor`。
+5. 权限至少选择 `Read & Write`。
+6. 创建后立刻复制 token。
+
+这个 token 只显示一次。如果关掉页面后忘了，就删除旧 token 再创建一个新的。
+
+#### 1.3 在 GitHub 添加 Actions Secrets
+
+进入你的 GitHub 仓库：
+
+```text
+https://github.com/mghts/vps-monitor
+```
+
+依次打开：
+
+```text
+Settings -> Secrets and variables -> Actions -> New repository secret
+```
+
+添加两个 Secret：
+
+```text
+DOCKERHUB_USERNAME = 你的 Docker Hub 用户名
+DOCKERHUB_TOKEN    = 刚才复制的 Docker Hub Access Token
+```
+
+注意这里填的是 Docker Hub 的用户名，不是 GitHub 用户名。
+
+#### 1.4 运行镜像发布 workflow
+
+进入 GitHub 仓库的 `Actions` 页面，左侧选择：
+
+```text
+Publish Docker Images
+```
+
+点击 `Run workflow`：
+
+```text
+version     = v0.1.0
+push_latest = 勾选
+```
+
+然后点击绿色的 `Run workflow` 按钮，等待任务完成。
+
+注意：本项目的 `v0.1.0` tag 已经创建过一次。因为 Docker Hub 发布 workflow 是后面新增的，所以第一次发布 `v0.1.0` 镜像时需要你手动点一次 `Run workflow`。以后如果推送新的 `v*` tag，例如 `v0.1.1`，workflow 会自动发布对应版本镜像。
+
+#### 1.5 检查镜像是否发布成功
+
+在 Mac 或任意装了 Docker 的机器上执行：
+
+```bash
+docker buildx imagetools inspect <你的 DockerHub 用户名>/vps-monitor-server:v0.1.0
+docker buildx imagetools inspect <你的 DockerHub 用户名>/vps-monitor-agent:v0.1.0
+```
+
+输出里应该能看到：
+
+```text
+linux/amd64
+linux/arm64
+```
+
+如果你的 VPS 是普通 x86_64，必须至少包含 `linux/amd64`。如果你的 VPS 是 ARM 服务器，必须包含 `linux/arm64`。
+
+#### 1.6 在 VPS 的 `.env` 里使用版本镜像
+
+后面创建 `.env` 时，把镜像写成固定版本：
+
+```env
+SERVER_IMAGE=<你的 DockerHub 用户名>/vps-monitor-server:v0.1.0
+AGENT_IMAGE=<你的 DockerHub 用户名>/vps-monitor-agent:v0.1.0
+```
+
+不建议生产环境长期使用 `latest`。`latest` 适合测试，但一旦你以后发布新镜像，VPS 重新 `docker compose pull` 时可能直接升级，出了问题不好回滚。固定 `v0.1.0` 这种版本号更稳。
+
+### 备用方式：本地手动 buildx 推送
+
+如果你暂时不想用 GitHub Actions，也可以在 Mac 本地手动构建并推送镜像。
 
 如果你是在 Apple Silicon Mac，也就是 M1/M2/M3/M4 上构建镜像，生产环境不要直接用普通 `docker build`。普通构建会默认生成 `linux/arm64` 镜像，而大多数 VPS 是 `linux/amd64`，部署时会出现：
 
@@ -37,6 +152,7 @@ docker buildx inspect --bootstrap
 docker buildx build \
   --platform linux/amd64,linux/arm64 \
   -f deploy/server.Dockerfile \
+  -t <你的 DockerHub 用户名>/vps-monitor-server:v0.1.0 \
   -t <你的 DockerHub 用户名>/vps-monitor-server:latest \
   --push \
   .
@@ -44,12 +160,13 @@ docker buildx build \
 docker buildx build \
   --platform linux/amd64,linux/arm64 \
   -f deploy/agent.Dockerfile \
+  -t <你的 DockerHub 用户名>/vps-monitor-agent:v0.1.0 \
   -t <你的 DockerHub 用户名>/vps-monitor-agent:latest \
   --push \
   .
 
-docker buildx imagetools inspect <你的 DockerHub 用户名>/vps-monitor-server:latest
-docker buildx imagetools inspect <你的 DockerHub 用户名>/vps-monitor-agent:latest
+docker buildx imagetools inspect <你的 DockerHub 用户名>/vps-monitor-server:v0.1.0
+docker buildx imagetools inspect <你的 DockerHub 用户名>/vps-monitor-agent:v0.1.0
 ```
 
 检查输出里应该同时能看到 `linux/amd64` 和 `linux/arm64`。如果你的 VPS 是普通 x86_64，一定要至少包含 `linux/amd64`。
@@ -62,18 +179,18 @@ docker login
 docker buildx build \
   --platform linux/amd64 \
   -f deploy/server.Dockerfile \
-  -t <你的 DockerHub 用户名>/vps-monitor-server:latest \
+  -t <你的 DockerHub 用户名>/vps-monitor-server:v0.1.0 \
   --push \
   .
 
 docker buildx build \
   --platform linux/amd64 \
   -f deploy/agent.Dockerfile \
-  -t <你的 DockerHub 用户名>/vps-monitor-agent:latest \
+  -t <你的 DockerHub 用户名>/vps-monitor-agent:v0.1.0 \
   --push \
   .
 
-docker buildx imagetools inspect <你的 DockerHub 用户名>/vps-monitor-agent:latest
+docker buildx imagetools inspect <你的 DockerHub 用户名>/vps-monitor-agent:v0.1.0
 ```
 
 如果你还想用非 Docker/systemd Agent，不需要在中心端放二进制文件。推荐把本项目推到 GitHub，然后用本项目自带的 `.github/workflows/release-agent.yml` 自动编译并发布 GitHub Releases。中心端只需要在 `.env` 里配置 GitHub raw 安装脚本地址和 Releases 仓库名。
@@ -156,8 +273,8 @@ SETUP_TOKEN=换成超长随机首次注册令牌
 BASE_URL=https://monitor.example.com
 SERVER_PORT=127.0.0.1:8080
 
-SERVER_IMAGE=<你的 DockerHub 用户名>/vps-monitor-server:latest
-AGENT_IMAGE=<你的 DockerHub 用户名>/vps-monitor-agent:latest
+SERVER_IMAGE=<你的 DockerHub 用户名>/vps-monitor-server:v0.1.0
+AGENT_IMAGE=<你的 DockerHub 用户名>/vps-monitor-agent:v0.1.0
 
 # Agent 一键安装脚本，建议放在你的 GitHub 仓库。
 AGENT_INSTALLER_URL=https://raw.githubusercontent.com/mghts/vps-monitor/refs/heads/main/agent/install.sh
@@ -174,8 +291,8 @@ RUST_LOG=info
 
 关键点：
 
-- `SERVER_IMAGE` 是中心端镜像。
-- `AGENT_IMAGE` 是 Docker 版 Agent 一键安装命令使用的镜像。
+- `SERVER_IMAGE` 是中心端镜像，生产环境建议写固定版本号。
+- `AGENT_IMAGE` 是 Docker 版 Agent 一键安装命令使用的镜像，建议和中心端使用同一个版本号。
 - `AGENT_INSTALLER_URL` 是后台生成 Agent 安装命令时使用的脚本地址，推荐使用 GitHub raw 链接。
 - `AGENT_RELEASE_REPOSITORY` 是 systemd/native Agent 二进制所在的 GitHub Releases 仓库。当前 `agent/install.sh` 已默认使用 `mghts/vps-monitor`，所以这里可以留空以保持安装命令更短。
 - `AGENT_RELEASE_TAG=latest` 表示安装最新 release；如果你希望所有节点固定版本，可以写成 `v0.1.0`。
@@ -371,7 +488,7 @@ https://cdn.jsdelivr.net/npm/geolite2-city/GeoLite2-City.mmdb.gz
 
 ## 11. 更新中心端
 
-当你推送新镜像后，在中心端执行：
+当你通过 `Publish Docker Images` workflow 发布新版本镜像后，在中心端执行：
 
 ```bash
 cd /docker/vps-monitor
@@ -382,8 +499,8 @@ docker compose logs -f server
 
 如果你修改了 Web UI 但 VPS 上仍然显示旧主题，优先检查这几件事：
 
-1. 你是否只在 Mac 本地 `docker build` 了镜像，但没有 `docker buildx build --push` 推送到 `.env` 里的 `SERVER_IMAGE`。
-2. `.env` 里的 `SERVER_IMAGE` 是否还是旧 tag。建议不要长期只用 `latest`，可以用日期或版本号，例如 `vps-monitor-server:2026-06-12-ui`，更新 `.env` 后再执行 `docker compose pull && docker compose up -d --force-recreate`。
+1. `Publish Docker Images` workflow 是否已经成功完成。
+2. `.env` 里的 `SERVER_IMAGE` 是否还是旧 tag。生产环境建议使用版本号，例如 `vps-monitor-server:v0.1.1`，更新 `.env` 后再执行 `docker compose pull && docker compose up -d --force-recreate`。
 3. 在 VPS 上执行 `docker compose images`，确认 `server` 使用的是刚推送的新镜像。
 4. 浏览器强制刷新页面；如果前面套了 CDN 或额外 Nginx 缓存，也需要清掉缓存。默认教程里的 Nginx 反代不主动缓存静态文件。
 
@@ -426,22 +543,24 @@ The requested image's platform (linux/arm64) does not match the detected host pl
 exec /usr/local/bin/vps-monitor-agent: exec format error
 ```
 
-说明你给 amd64 VPS 使用了 arm64-only 的 Agent 镜像。通常发生在 Apple Silicon Mac 上直接 `docker build` 后推送镜像。修复方式是在 Mac 或 CI 上重新构建并推送 `linux/amd64` 或多架构 Agent 镜像：
+说明你给 amd64 VPS 使用了 arm64-only 的 Agent 镜像。通常发生在 Apple Silicon Mac 上直接 `docker build` 后推送镜像。优先修复方式是在 GitHub Actions 里重新运行 `Publish Docker Images` workflow，确认它成功发布多架构镜像。
+
+如果你选择备用的本地手动构建方式，就在 Mac 或 CI 上重新构建并推送 `linux/amd64` 或多架构 Agent 镜像：
 
 ```bash
 docker buildx build \
   --platform linux/amd64,linux/arm64 \
   -f deploy/agent.Dockerfile \
-  -t <你的 DockerHub 用户名>/vps-monitor-agent:latest \
+  -t <你的 DockerHub 用户名>/vps-monitor-agent:v0.1.0 \
   --push \
   .
 
-docker buildx imagetools inspect <你的 DockerHub 用户名>/vps-monitor-agent:latest
+docker buildx imagetools inspect <你的 DockerHub 用户名>/vps-monitor-agent:v0.1.0
 ```
 
 然后在出错的目标 VPS 上删除坏容器并重新执行后台生成的 Agent 安装命令：
 
 ```bash
 docker rm -f vps-monitor-agent
-docker image rm <你的 DockerHub 用户名>/vps-monitor-agent:latest
+docker image rm <你的 DockerHub 用户名>/vps-monitor-agent:v0.1.0
 ```
