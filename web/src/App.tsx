@@ -341,7 +341,12 @@ export default function App() {
         <div className="content-viewport">
           {error && <div className="global-error">{error}</div>}
           {adminOpen ? (
-            <AdminPanel demo={demo} onChanged={loadSummary} onExit={() => openRoute({ section, selectedServerId: null, adminOpen: false }, 'replace')} />
+            <AdminPanel
+              demo={demo}
+              refreshIntervalSeconds={refreshIntervalSeconds}
+              onChanged={loadSummary}
+              onExit={() => openRoute({ section, selectedServerId: null, adminOpen: false }, 'replace')}
+            />
           ) : summary ? (
             <Dashboard
               summary={summary}

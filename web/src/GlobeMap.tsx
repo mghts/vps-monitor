@@ -7,7 +7,9 @@ export type GlobeNodeMember = {
   id: string;
   name: string;
   online: boolean;
+  isCenter?: boolean;
   city?: string;
+  region?: string;
   country?: string;
   ipMasked?: string;
 };
@@ -16,10 +18,12 @@ export type GlobeNode = {
   id: string;
   name: string;
   online: boolean;
+  isCenter?: boolean;
   status?: 'online' | 'offline' | 'mixed';
   latitude: number;
   longitude: number;
   city?: string;
+  region?: string;
   country?: string;
   ipMasked?: string;
   members?: GlobeNodeMember[];
@@ -32,6 +36,10 @@ type Props = {
     latitude: number;
     longitude: number;
     name: string;
+    city?: string;
+    region?: string;
+    country?: string;
+    ipMasked?: string;
   } | null;
   onSelectNode?: (nodeId: string) => void;
 };
@@ -181,6 +189,12 @@ const GlobeMap = forwardRef<GlobeMapHandle, Props>(function GlobeMap({ nodes, ce
   const { t } = useI18n();
   const mountRef = useRef<HTMLDivElement>(null);
   const resetRef = useRef<() => void>(() => undefined);
+  const onSelectNodeRef = useRef(onSelectNode);
+  const viewStateRef = useRef<{
+    globeQuaternion: THREE.Quaternion;
+    cameraPosition: THREE.Vector3;
+    controlsTarget: THREE.Vector3;
+  } | null>(null);
   const pinnedRef = useRef(false);
   const markerMaterialsRef = useRef(new Map<string, THREE.MeshBasicMaterial>());
   const [selected, setSelected] = useState<GlobeNode | null>(null);
@@ -188,12 +202,16 @@ const GlobeMap = forwardRef<GlobeMapHandle, Props>(function GlobeMap({ nodes, ce
   const [failed, setFailed] = useState(false);
   const geometryKey = useMemo(
     () => [
-      center ? `${center.latitude}:${center.longitude}` : 'no-center',
+      center ? `${center.latitude}:${center.longitude}:${center.name}:${center.city || ''}:${center.region || ''}:${center.country || ''}:${center.ipMasked || ''}` : 'no-center',
       theme,
-      ...nodes.map((node) => `${node.id}:${node.online}:${node.status || ''}:${node.latitude}:${node.longitude}:${node.members?.length || 1}`)
+      ...nodes.map((node) => `${node.id}:${node.online}:${node.status || ''}:${node.isCenter || false}:${node.latitude}:${node.longitude}:${node.name}:${node.city || ''}:${node.region || ''}:${node.country || ''}:${node.ipMasked || ''}:${node.members?.map((member) => `${member.id}:${member.name}:${member.online}:${member.isCenter || false}:${member.ipMasked || ''}`).join(',') || ''}`)
     ].join('|'),
-    [center?.latitude, center?.longitude, nodes, theme]
+    [center?.latitude, center?.longitude, center?.name, center?.city, center?.region, center?.country, center?.ipMasked, nodes, theme]
   );
+
+  useEffect(() => {
+    onSelectNodeRef.current = onSelectNode;
+  }, [onSelectNode]);
 
   useImperativeHandle(ref, () => ({
     resetView: () => resetRef.current()
@@ -271,8 +289,24 @@ const GlobeMap = forwardRef<GlobeMapHandle, Props>(function GlobeMap({ nodes, ce
       const centerMarker = new THREE.Mesh(
         new THREE.SphereGeometry(0.043, 24, 24),
         new THREE.MeshBasicMaterial({ color: theme === 'light' ? 0x4ea3a1 : 0x7dc9c2 })
-      );
+      ) as THREE.Mesh & { userData: { node?: GlobeNode } };
       centerMarker.position.copy(centerPosition);
+      if (!nodes.some((node) => node.isCenter)) {
+        centerMarker.userData.node = {
+          id: '__center__',
+          name: center.name,
+          online: true,
+          isCenter: true,
+          latitude: center.latitude,
+          longitude: center.longitude,
+          city: center.city,
+          region: center.region,
+          country: center.country,
+          ipMasked: center.ipMasked,
+          members: []
+        };
+        nodeMeshes.push(centerMarker);
+      }
       globeGroup.add(centerMarker);
 
       const centerCore = new THREE.Mesh(
@@ -378,7 +412,13 @@ const GlobeMap = forwardRef<GlobeMapHandle, Props>(function GlobeMap({ nodes, ce
       controls.update();
     };
     resetRef.current = resetView;
-    resetView();
+    if (viewStateRef.current) {
+      globeGroup.quaternion.copy(viewStateRef.current.globeQuaternion);
+      camera.position.copy(viewStateRef.current.cameraPosition);
+      controls.target.copy(viewStateRef.current.controlsTarget);
+    } else {
+      resetView();
+    }
     controls.update();
 
     const raycaster = new THREE.Raycaster();
@@ -420,8 +460,12 @@ const GlobeMap = forwardRef<GlobeMapHandle, Props>(function GlobeMap({ nodes, ce
         pinnedRef.current = true;
         setSelectionPinned(true);
         setSelected(node);
+      } else if (node.isCenter && members.length === 0) {
+        pinnedRef.current = true;
+        setSelectionPinned(true);
+        setSelected(node);
       } else {
-        onSelectNode?.(members[0]?.id || node.id);
+        onSelectNodeRef.current?.(members[0]?.id || node.id);
       }
     };
     renderer.domElement.style.cursor = 'grab';
@@ -460,6 +504,11 @@ const GlobeMap = forwardRef<GlobeMapHandle, Props>(function GlobeMap({ nodes, ce
 
     return () => {
       disposed = true;
+      viewStateRef.current = {
+        globeQuaternion: globeGroup.quaternion.clone(),
+        cameraPosition: camera.position.clone(),
+        controlsTarget: controls.target.clone()
+      };
       cancelAnimationFrame(frame);
       observer.disconnect();
       renderer.domElement.removeEventListener('pointermove', handlePointerMove);
@@ -479,7 +528,7 @@ const GlobeMap = forwardRef<GlobeMapHandle, Props>(function GlobeMap({ nodes, ce
       renderer.domElement.remove();
       markerMaterialsRef.current.clear();
     };
-  }, [geometryKey, onSelectNode]);
+  }, [geometryKey]);
 
   useEffect(() => {
     nodes.forEach((node) => {
@@ -488,14 +537,30 @@ const GlobeMap = forwardRef<GlobeMapHandle, Props>(function GlobeMap({ nodes, ce
       );
     });
     setSelected((current) => {
-      const next = current ? nodes.find((node) => node.id === current.id) || null : null;
+      const next = current?.id === '__center__' && center
+        ? {
+            id: '__center__',
+            name: center.name,
+            online: true,
+            isCenter: true,
+            latitude: center.latitude,
+            longitude: center.longitude,
+            city: center.city,
+            region: center.region,
+            country: center.country,
+            ipMasked: center.ipMasked,
+            members: []
+          }
+        : current
+          ? nodes.find((node) => node.id === current.id) || null
+          : null;
       if (!next) {
         pinnedRef.current = false;
         setSelectionPinned(false);
       }
       return next;
     });
-  }, [nodes, theme]);
+  }, [center, nodes, theme]);
 
   function closeSelection() {
     pinnedRef.current = false;
@@ -507,24 +572,31 @@ const GlobeMap = forwardRef<GlobeMapHandle, Props>(function GlobeMap({ nodes, ce
     <div className="globe-stage">
       <div ref={mountRef} className="globe-canvas" />
       {failed && <div className="map-empty">{t('三维地球纹理加载失败')}</div>}
-      {!nodes.length && !failed && <div className="globe-empty">{t('等待具有经纬度的节点接入')}</div>}
+      {!nodes.length && !center && !failed && <div className="globe-empty">{t('等待具有经纬度的节点接入')}</div>}
       {selected && (
         <div className="globe-popover">
           {selectionPinned && <button className="globe-popover-close" onClick={closeSelection}>×</button>}
           <b>{selected.name}</b>
-          <span>{[selected.city, selected.country].filter(Boolean).join(' · ') || t('未知位置')}</span>
+          <span>{[selected.city, selected.region, selected.country].filter(Boolean).join(' · ') || t('未知位置')}</span>
+          {selected.isCenter && (
+            <span className="center-node-note">
+              {selected.members?.length ? t('同时也是中心节点') : t('中心节点')}
+            </span>
+          )}
           {selected.members && selected.members.length > 1 ? (
             <div className="globe-node-picker">
               {selected.members.map((member) => (
-                <button key={member.id} onClick={() => onSelectNode?.(member.id)}>
+                <button key={member.id} onClick={() => onSelectNodeRef.current?.(member.id)}>
                   <i className={member.online ? 'online' : 'offline'} />
                   <span>{member.name}</span>
-                  <small>{member.ipMasked || t('IP 待上报')}</small>
+                  <small>{member.ipMasked || t('IP 待上报')}{member.isCenter ? ` · ${t('中心节点')}` : ''}</small>
                 </button>
               ))}
             </div>
           ) : (
-            <span>IP：{selected.members?.[0]?.ipMasked || selected.ipMasked || t('IP 待上报')}</span>
+            <>
+              <span>IP：{selected.members?.[0]?.ipMasked || selected.ipMasked || t('IP 待上报')}</span>
+            </>
           )}
         </div>
       )}

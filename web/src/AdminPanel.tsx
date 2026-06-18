@@ -63,7 +63,17 @@ const demoSettings: Settings = {
   ]
 };
 
-export default function AdminPanel({ demo = false, onChanged, onExit }: { demo?: boolean; onChanged: () => void; onExit: () => void }) {
+export default function AdminPanel({
+  demo = false,
+  refreshIntervalSeconds,
+  onChanged,
+  onExit
+}: {
+  demo?: boolean;
+  refreshIntervalSeconds: number;
+  onChanged: () => void;
+  onExit: () => void;
+}) {
   const [hasAdmin, setHasAdmin] = useState<boolean | null>(null);
   const [authed, setAuthed] = useState(false);
   const [message, setMessage] = useState('');
@@ -101,7 +111,12 @@ export default function AdminPanel({ demo = false, onChanged, onExit }: { demo?:
   if (hasAdmin === null) return <AdminLoading />;
   if (!hasAdmin) return <RegisterForm onDone={refreshAuth} onExit={onExit} />;
   if (!authed) return <LoginForm onDone={() => { setAuthed(true); onChanged(); }} onExit={onExit} message={message} />;
-  return <AdminWorkspace demo={demo} onChanged={onChanged} onLogout={() => demo ? onExit() : postJson('/api/auth/logout', {}).finally(onExit)} />;
+  return <AdminWorkspace
+    demo={demo}
+    refreshIntervalSeconds={refreshIntervalSeconds}
+    onChanged={onChanged}
+    onLogout={() => demo ? onExit() : postJson('/api/auth/logout', {}).finally(onExit)}
+  />;
 }
 
 function AdminLoading() {
@@ -214,7 +229,17 @@ function AuthShell({
   );
 }
 
-function AdminWorkspace({ demo = false, onChanged, onLogout }: { demo?: boolean; onChanged: () => void; onLogout: () => void }) {
+function AdminWorkspace({
+  demo = false,
+  refreshIntervalSeconds,
+  onChanged,
+  onLogout
+}: {
+  demo?: boolean;
+  refreshIntervalSeconds: number;
+  onChanged: () => void;
+  onLogout: () => void;
+}) {
   const { t } = useI18n();
   const [tab, setTab] = useState<AdminTab>('servers');
   const [servers, setServers] = useState<ServerNode[]>([]);
@@ -250,6 +275,17 @@ function AdminWorkspace({ demo = false, onChanged, onLogout }: { demo?: boolean;
   useEffect(() => {
     load().catch((reason) => setError(reason.message));
   }, [demo]);
+
+  useEffect(() => {
+    if (demo) return undefined;
+    const refreshServerStatus = () => {
+      api<ServerNode[]>('/api/admin/servers')
+        .then((serverData) => setServers(serverData))
+        .catch((reason) => setError(reason.message));
+    };
+    const timer = window.setInterval(refreshServerStatus, refreshIntervalSeconds * 1000);
+    return () => window.clearInterval(timer);
+  }, [demo, refreshIntervalSeconds]);
 
   const tabs = [
     { id: 'servers', label: t('节点'), icon: <HardDrives size={18} />, count: servers.length },

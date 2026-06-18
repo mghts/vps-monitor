@@ -17,6 +17,7 @@ export type ServerNode = {
   id: string;
   name: string;
   online: boolean;
+  is_center?: boolean;
   public_visible: boolean;
   last_seen_at?: string | null;
   ip_masked?: string;

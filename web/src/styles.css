@@ -1057,6 +1057,7 @@ code {
 
 .leaflet-tile {
   filter: saturate(0.78) sepia(0.08) contrast(0.9) brightness(1.04);
+  image-rendering: auto;
 }
 
 :root[data-theme="dark"] .leaflet-tile {
@@ -1134,6 +1135,18 @@ code {
 .map-cluster-picker i.offline,
 .globe-node-picker i.offline {
   background: var(--red);
+}
+
+.map-cluster-tooltip .cluster-node-line i.center,
+.map-cluster-picker i.center,
+.globe-node-picker i.center {
+  background: var(--cyan);
+}
+
+.center-node-note {
+  color: var(--cyan) !important;
+  font-family: var(--font-hand);
+  font-weight: 750;
 }
 
 .map-cluster-picker {
@@ -2313,6 +2326,10 @@ tbody tr:last-child td {
   align-items: center;
 }
 
+.ping-header > div:first-child {
+  flex: 0 0 auto;
+}
+
 .dashboard-secondary > .ping-surface:not(.expanded):not(.detail-compact) .ping-header {
   min-height: 60px;
   padding: 12px 16px;
@@ -2320,6 +2337,16 @@ tbody tr:last-child td {
 
 .ping-header .ping-selectors {
   margin-left: auto;
+}
+
+.dashboard-secondary > .ping-surface:not(.expanded):not(.detail-compact) .ping-selectors label {
+  grid-template-columns: minmax(0, 132px);
+  gap: 2px;
+}
+
+.dashboard-secondary > .ping-surface:not(.expanded):not(.detail-compact) .ping-select-drawer {
+  width: 132px;
+  min-width: 0;
 }
 
 .ping-selectors label {
@@ -2360,6 +2387,29 @@ tbody tr:last-child td {
   gap: 20px;
   border-bottom: 1px dashed var(--border);
   padding: 6px 12px;
+}
+
+.ping-meta.expanded-controls {
+  min-height: 60px;
+  flex-wrap: wrap;
+  gap: 10px 16px;
+  padding: 9px 16px;
+}
+
+.ping-meta.expanded-controls .ping-selectors {
+  margin-left: auto;
+}
+
+.ping-meta.expanded-controls .ping-selectors label:first-child {
+  grid-template-columns: auto minmax(240px, 280px);
+}
+
+.ping-meta.expanded-controls .ping-selectors label:first-child .ping-select-drawer {
+  width: 280px;
+}
+
+.ping-meta.expanded-controls .range-tabs {
+  margin-left: 0;
 }
 
 .ping-mode {

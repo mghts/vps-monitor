@@ -72,6 +72,15 @@ type LocationCluster = {
   onlineCount: number;
   status: LocationClusterStatus;
 };
+type MapCenter = {
+  latitude: number;
+  longitude: number;
+  name: string;
+  city?: string;
+  region?: string;
+  country?: string;
+  ipMasked?: string;
+};
 type PingPoint = {
   ts: string;
   target_id?: string | null;
@@ -132,6 +141,18 @@ function normalizeLongitude(longitude: number) {
 
 function locationClusterKey(latitude: number, longitude: number) {
   return `${latitude.toFixed(3)}:${normalizeLongitude(longitude).toFixed(3)}`;
+}
+
+function serverIsCenter(server: ServerNode) {
+  return Boolean(server.is_center);
+}
+
+function clusterIsCenter(cluster: LocationCluster) {
+  return cluster.servers.some(serverIsCenter);
+}
+
+function centerLocationText(center: MapCenter, fallback: string) {
+  return [center.city, center.region, center.country].filter(Boolean).join(' · ') || fallback;
 }
 
 function locationClusters(servers: ServerNode[]): LocationCluster[] {
@@ -321,27 +342,35 @@ function WorldMapPanel({
       .filter((server) => !query || `${server.name} ${server.location.city || ''} ${server.location.country || ''} ${serverLocationText(server, t)}`.toLowerCase().includes(query.toLowerCase())),
     [filter, language, query, summary.servers]
   );
-  const center = summary.settings.center_latitude != null && summary.settings.center_longitude != null
+  const center: MapCenter | null = summary.settings.center_latitude != null && summary.settings.center_longitude != null
     ? {
         latitude: Number(summary.settings.center_latitude),
         longitude: Number(summary.settings.center_longitude),
-        name: summary.settings.center_name ? t(summary.settings.center_name) : t('中心节点')
+        name: summary.settings.center_name ? t(summary.settings.center_name) : t('中心节点'),
+        city: localizedText(summary.settings.center_auto_city, t),
+        region: localizedText(summary.settings.center_auto_region, t),
+        country: localizedText(summary.settings.center_auto_country, t),
+        ipMasked: summary.settings.center_auto_ip || undefined
       }
     : null;
   const mapCenter: [number, number] = center
     ? [center.latitude, center.longitude]
     : [Number(points[0]?.location.latitude ?? 22), Number(points[0]?.location.longitude ?? 104)];
   const clusters = useMemo(() => locationClusters(points), [points]);
+  const centerCluster = center ? clusters.find(clusterIsCenter) : undefined;
   const globeNodes: GlobeNode[] = useMemo(() => clusters.map((cluster) => {
     const first = cluster.servers[0];
+    const isCenter = Boolean(center && clusterIsCenter(cluster));
     return {
       id: cluster.key,
       name: clusterLabel(cluster, t),
       online: cluster.status !== 'offline',
       status: cluster.status,
+      isCenter,
       latitude: cluster.latitude,
       longitude: cluster.longitude,
       city: localizedText(first?.location.city, t),
+      region: localizedText(first?.location.region, t),
       country: localizedText(first?.location.country, t),
       ipMasked: first?.ip_masked,
       members: cluster.servers.map((server) => ({
@@ -349,11 +378,23 @@ function WorldMapPanel({
         name: server.name,
         online: server.online,
         city: localizedText(server.location.city, t),
+        region: localizedText(server.location.region, t),
         country: localizedText(server.location.country, t),
-        ipMasked: server.ip_masked
+        ipMasked: server.ip_masked,
+        isCenter: Boolean(center && serverIsCenter(server))
       }))
     };
-  }), [language, clusters]);
+  }), [
+    language,
+    clusters,
+    center?.latitude,
+    center?.longitude,
+    center?.name,
+    center?.city,
+    center?.region,
+    center?.country,
+    center?.ipMasked
+  ]);
   const offlineBreakIcon = useMemo(() => divIcon({
     className: 'map-offline-break-marker',
     html: '<span><i></i><i></i></span>',
@@ -420,10 +461,12 @@ function WorldMapPanel({
           >
             <TileLayer
               attribution="Tiles &copy; Esri"
+              detectRetina
               url={`https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/${theme === 'light' ? 'World_Light_Gray_Base' : 'World_Dark_Gray_Base'}/MapServer/tile/{z}/{y}/{x}`}
             />
             <TileLayer
               attribution="Tiles &copy; Esri"
+              detectRetina
               url={`https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/${theme === 'light' ? 'World_Light_Gray_Reference' : 'World_Dark_Gray_Reference'}/MapServer/tile/{z}/{y}/{x}`}
             />
             {center && worldShifts.map((shift) => (
@@ -434,14 +477,23 @@ function WorldMapPanel({
                   interactive={false}
                   pathOptions={{ color: theme === 'light' ? '#4ea3a1' : '#7dc9c2', fillColor: theme === 'light' ? '#4ea3a1' : '#7dc9c2', fillOpacity: 0.08, opacity: 0.54, weight: 1.8 }}
                 />
-                <CircleMarker
-                  center={[center.latitude, center.longitude + shift]}
-                  radius={10}
-                  className="map-center-node"
-                  pathOptions={{ color: theme === 'light' ? '#fffdf6' : '#efe6d2', fillColor: theme === 'light' ? '#4ea3a1' : '#7dc9c2', fillOpacity: 1, weight: 4 }}
-                >
-                  <Popup><b>{center.name}</b><br />{t('中心节点')}</Popup>
-                </CircleMarker>
+                {!centerCluster && (
+                  <CircleMarker
+                    center={[center.latitude, center.longitude + shift]}
+                    radius={10}
+                    className="map-center-node"
+                    pathOptions={{ color: theme === 'light' ? '#fffdf6' : '#efe6d2', fillColor: theme === 'light' ? '#4ea3a1' : '#7dc9c2', fillOpacity: 1, weight: 4 }}
+                  >
+                    <LeafletTooltip className="map-node-tooltip map-cluster-tooltip" direction="top" offset={[0, -12]} opacity={1}>
+                      <b>{center.name}</b>
+                      <span>{centerLocationText(center, t('未知位置'))}</span>
+                      <span className="cluster-node-line center-node-line">
+                        <i className="center" />
+                        {t('中心节点')} · {center.ipMasked || t('IP 待上报')}
+                      </span>
+                    </LeafletTooltip>
+                  </CircleMarker>
+                )}
               </Fragment>
             ))}
             {clusters.flatMap((cluster) => worldShifts.map((shift) => {
@@ -487,6 +539,7 @@ function WorldMapPanel({
                         <span className="cluster-node-line" key={server.id}>
                           <i className={server.online ? 'online' : 'offline'} />
                           {server.name} · {server.online ? t('在线') : t('离线')} · {server.ip_masked || t('IP 待上报')}
+                          {center && serverIsCenter(server) ? ` · ${t('同时也是中心节点')}` : ''}
                         </span>
                       ))}
                     </LeafletTooltip>
@@ -496,6 +549,7 @@ function WorldMapPanel({
                           <b>{cluster.servers[0].name}</b><br />
                           {serverLocationLabel(cluster.servers[0], t, t('未知位置'))}<br />
                           {cluster.servers[0].online ? t('在线') : t('离线')}
+                          {center && serverIsCenter(cluster.servers[0]) && <><br />{t('同时也是中心节点')}</>}
                         </>
                       ) : (
                         <div className="map-cluster-picker">
@@ -505,7 +559,7 @@ function WorldMapPanel({
                             <button key={server.id} onClick={() => onSelectServer(server.id)}>
                               <i className={server.online ? 'online' : 'offline'} />
                               <span>{server.name}</span>
-                              <small>{server.ip_masked || t('IP 待上报')}</small>
+                              <small>{server.ip_masked || t('IP 待上报')}{center && serverIsCenter(server) ? ` · ${t('中心节点')}` : ''}</small>
                             </button>
                           ))}
                         </div>
@@ -612,7 +666,7 @@ function WorldMapPanel({
           <Crosshair size={16} />
           <span>{t('中心节点')}</span>
         </button>
-        {!points.length && mode === '2d' && (
+        {!points.length && !center && mode === '2d' && (
           <div className="map-empty">
             <MapTrifold size={28} />
             <span>{t('暂无可显示的节点坐标')}</span>
@@ -1380,12 +1434,12 @@ function PingPanel({
           <div><h2>{t('延迟记录')}</h2></div>
           {selectorControls}
         </div>
-      ) : (
+      ) : !expanded ? (
         <div className="surface-header ping-header">
           {selectorControls}
         </div>
-      )}
-      <div className="ping-meta">
+      ) : null}
+      <div className={`ping-meta ${expanded ? 'expanded-controls' : ''}`}>
         <div><span>{t('平均延迟')}</span><b>{points.length ? `${latencyAverage.toFixed(1)} ms` : '--'}</b></div>
         <div><span>{t('平均丢包')}</span><b className={lossAverage > 1 ? 'text-bad' : ''}>{points.length ? `${lossAverage.toFixed(2)}%` : '--'}</b></div>
         <div className="segmented ping-mode" aria-label={t('Ping 图表显示内容')}>
@@ -1393,6 +1447,7 @@ function PingPanel({
           <button className={displayMode === 'loss' ? 'active' : ''} onClick={() => setDisplayMode('loss')}>{t('丢包')}</button>
           <button className={displayMode === 'both' ? 'active' : ''} onClick={() => setDisplayMode('both')}>{t('延迟 + 丢包')}</button>
         </div>
+        {expanded && selectorControls}
         <div className="range-tabs">
           {ranges.map(([value, label]) => (
             <button key={value} className={range === value ? 'active' : ''} onClick={() => setRange(value)}>{label}</button>

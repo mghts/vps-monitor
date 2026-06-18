@@ -1416,9 +1416,29 @@ async fn public_summary(State(state): State<AppState>) -> Result<Json<Value>, Ap
         .fetch_optional(&state.pool)
         .await?
         .unwrap_or_else(|| json!({}));
-    let public_settings = resolve_public_settings(&state, public_settings).await?;
+    let mut public_settings = resolve_public_settings(&state, public_settings).await?;
+    let center_ip = public_settings
+        .get("center_auto_ip")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let servers = rows
+        .into_iter()
+        .map(|r| {
+            let is_center = center_ip.as_deref().is_some_and(|ip| {
+                r.try_get::<String, _>("last_public_ip").ok().as_deref() == Some(ip)
+            });
+            let mut server = public_server_row_to_json(&r);
+            if let Value::Object(ref mut object) = server {
+                object.insert("is_center".to_string(), json!(is_center));
+            }
+            server
+        })
+        .collect::<Vec<_>>();
+    if let Some(ip) = center_ip.as_deref() {
+        public_settings["center_auto_ip"] = json!(mask_ip(ip));
+    }
     Ok(Json(json!({
-        "servers": rows.into_iter().map(|r| public_server_row_to_json(&r)).collect::<Vec<_>>(),
+        "servers": servers,
         "ping_targets": targets,
         "settings": public_settings
     })))

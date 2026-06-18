@@ -30,6 +30,7 @@ const english: Record<string, string> = {
   '查看告警': 'View alerts',
   '中心节点位置': 'Center Location',
   '中心节点': 'Center Node',
+  '同时也是中心节点': 'Also the center node',
   '系统状态': 'System Status',
   '运行正常': 'Operational',
   '连接异常': 'Connection error',
