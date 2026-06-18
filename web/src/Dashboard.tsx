@@ -2,6 +2,8 @@ import { Fragment, lazy, Suspense, useEffect, useMemo, useRef, useState } from '
 import {
   ArrowLeft,
   ArrowsClockwise,
+  CaretDown,
+  CaretUp,
   CardsThree,
   ChartLine,
   Cpu,
@@ -40,6 +42,7 @@ import {
 import { api } from './api';
 import { demoMetricHistory, demoPingPoints } from './demo';
 import { average, fmtLoad, fmtPct, formatBytes, formatUptime, percent } from './format';
+import { SelectDrawer } from './SelectDrawer';
 import type { GlobeMapHandle, GlobeNode } from './GlobeMap';
 import { useI18n } from './i18n';
 import type { FleetSample, MetricHistoryPoint, PublicSection, PublicSummary, ServerNode } from './types';
@@ -60,6 +63,15 @@ const pingColorsLight = ['#4ea3a1', '#74ad82', '#9b7fca', '#d79a4d', '#d97974', 
 const worldShifts = [-360, 0, 360];
 
 type Coordinate = [number, number];
+type LocationClusterStatus = 'online' | 'offline' | 'mixed';
+type LocationCluster = {
+  key: string;
+  latitude: number;
+  longitude: number;
+  servers: ServerNode[];
+  onlineCount: number;
+  status: LocationClusterStatus;
+};
 type PingPoint = {
   ts: string;
   target_id?: string | null;
@@ -109,6 +121,71 @@ function greatCircleArc(start: Coordinate, end: Coordinate, steps = 72): Coordin
 function arcPointAt(arc: Coordinate[], ratio: number): Coordinate {
   const index = Math.max(0, Math.min(arc.length - 1, Math.round((arc.length - 1) * ratio)));
   return arc[index] || arc[0] || [0, 0];
+}
+
+function normalizeLongitude(longitude: number) {
+  let next = longitude;
+  while (next > 180) next -= 360;
+  while (next < -180) next += 360;
+  return next;
+}
+
+function locationClusterKey(latitude: number, longitude: number) {
+  return `${latitude.toFixed(3)}:${normalizeLongitude(longitude).toFixed(3)}`;
+}
+
+function locationClusters(servers: ServerNode[]): LocationCluster[] {
+  const groups = new Map<string, Array<{ server: ServerNode; latitude: number; longitude: number; order: number }>>();
+  servers.forEach((server, order) => {
+    const latitude = Number(server.location.latitude);
+    const longitude = Number(server.location.longitude);
+    if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) return;
+    const key = locationClusterKey(latitude, longitude);
+    const group = groups.get(key) || [];
+    group.push({ server, latitude, longitude, order });
+    groups.set(key, group);
+  });
+
+  return [...groups.entries()].flatMap(([clusterKey, group]) => {
+    const ordered = group.sort((a, b) => a.order - b.order);
+    const latitude = ordered.reduce((sum, item) => sum + item.latitude, 0) / ordered.length;
+    const longitude = ordered.reduce((sum, item) => sum + item.longitude, 0) / ordered.length;
+    const servers = ordered.map((item) => item.server);
+    const onlineCount = servers.filter((server) => server.online).length;
+    const status: LocationClusterStatus = onlineCount === servers.length
+      ? 'online'
+      : onlineCount === 0
+        ? 'offline'
+        : 'mixed';
+    return [{
+      key: clusterKey,
+      latitude,
+      longitude,
+      servers,
+      onlineCount,
+      status
+    }];
+  });
+}
+
+function clusterColor(status: LocationClusterStatus, theme: 'dark' | 'light') {
+  if (status === 'offline') return theme === 'light' ? '#d97974' : '#e58b83';
+  if (status === 'mixed') return theme === 'light' ? '#d79a4d' : '#e0ba72';
+  return theme === 'light' ? '#74ad82' : '#9ec989';
+}
+
+function clusterLineColor(status: LocationClusterStatus, theme: 'dark' | 'light') {
+  if (status === 'offline') return theme === 'light' ? '#d97974' : '#e58b83';
+  if (status === 'mixed') return theme === 'light' ? '#d79a4d' : '#e0ba72';
+  return theme === 'light' ? '#6aa8a5' : '#8ddad2';
+}
+
+function clusterLabel(cluster: LocationCluster, t: (source: string, variables?: Record<string, string | number>) => string) {
+  const first = cluster.servers[0];
+  const place = first ? serverLocationText(first, t, t('未知位置')) : t('未知位置');
+  return cluster.servers.length > 1
+    ? `${place} · ${cluster.servers.length} ${t('台节点')}`
+    : first?.name || place;
 }
 
 function uptimeBlocks(server: ServerNode) {
@@ -254,16 +331,29 @@ function WorldMapPanel({
   const mapCenter: [number, number] = center
     ? [center.latitude, center.longitude]
     : [Number(points[0]?.location.latitude ?? 22), Number(points[0]?.location.longitude ?? 104)];
-  const globeNodes: GlobeNode[] = useMemo(() => points.map((server) => ({
-    id: server.id,
-    name: server.name,
-    online: server.online,
-    latitude: Number(server.location.latitude),
-    longitude: Number(server.location.longitude),
-    city: localizedText(server.location.city, t),
-    country: localizedText(server.location.country, t),
-    ipMasked: server.ip_masked
-  })), [language, points]);
+  const clusters = useMemo(() => locationClusters(points), [points]);
+  const globeNodes: GlobeNode[] = useMemo(() => clusters.map((cluster) => {
+    const first = cluster.servers[0];
+    return {
+      id: cluster.key,
+      name: clusterLabel(cluster, t),
+      online: cluster.status !== 'offline',
+      status: cluster.status,
+      latitude: cluster.latitude,
+      longitude: cluster.longitude,
+      city: localizedText(first?.location.city, t),
+      country: localizedText(first?.location.country, t),
+      ipMasked: first?.ip_masked,
+      members: cluster.servers.map((server) => ({
+        id: server.id,
+        name: server.name,
+        online: server.online,
+        city: localizedText(server.location.city, t),
+        country: localizedText(server.location.country, t),
+        ipMasked: server.ip_masked
+      }))
+    };
+  }), [language, clusters]);
   const offlineBreakIcon = useMemo(() => divIcon({
     className: 'map-offline-break-marker',
     html: '<span><i></i><i></i></span>',
@@ -297,11 +387,17 @@ function WorldMapPanel({
               <GlobeHemisphereWest size={15} /> 3D
             </button>
           </div>
-          <select value={filter} onChange={(event) => setFilter(event.target.value as typeof filter)} aria-label={t('节点状态筛选')}>
-            <option value="all">{t('全部节点')}</option>
-            <option value="online">{t('在线')}</option>
-            <option value="offline">{t('异常')}</option>
-          </select>
+          <SelectDrawer
+            className="map-status-select"
+            value={filter}
+            ariaLabel={t('节点状态筛选')}
+            onChange={(next) => setFilter(next as typeof filter)}
+            options={[
+              { value: 'all', label: t('全部节点') },
+              { value: 'online', label: t('在线') },
+              { value: 'offline', label: t('异常') }
+            ]}
+          />
           <label className="map-search">
             <MagnifyingGlass size={16} />
             <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder={t('搜索地区')} />
@@ -323,8 +419,12 @@ function WorldMapPanel({
             className="map"
           >
             <TileLayer
-              attribution='&copy; OpenStreetMap &copy; CARTO'
-              url={`https://{s}.basemaps.cartocdn.com/${theme === 'light' ? 'rastertiles/voyager' : 'dark_all'}/{z}/{x}/{y}{r}.png`}
+              attribution="Tiles &copy; Esri"
+              url={`https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/${theme === 'light' ? 'World_Light_Gray_Base' : 'World_Dark_Gray_Base'}/MapServer/tile/{z}/{y}/{x}`}
+            />
+            <TileLayer
+              attribution="Tiles &copy; Esri"
+              url={`https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/${theme === 'light' ? 'World_Light_Gray_Reference' : 'World_Dark_Gray_Reference'}/MapServer/tile/{z}/{y}/{x}`}
             />
             {center && worldShifts.map((shift) => (
               <Fragment key={`center-${shift}`}>
@@ -344,60 +444,96 @@ function WorldMapPanel({
                 </CircleMarker>
               </Fragment>
             ))}
-            {points.flatMap((server) => worldShifts.map((shift) => {
+            {clusters.flatMap((cluster) => worldShifts.map((shift) => {
+              const primary = cluster.servers[0];
               const position: [number, number] = [
-                Number(server.location.latitude),
-                Number(server.location.longitude) + shift
+                cluster.latitude,
+                cluster.longitude + shift
               ];
-              const location = serverLocationText(server, t, t('未知位置'));
-              const bSegmentIp = server.ip_masked || t('IP 待上报');
+              const location = primary ? serverLocationText(primary, t, t('未知位置')) : t('未知位置');
+              const fillColor = clusterColor(cluster.status, theme);
               return (
-                <CircleMarker
-                  key={`${server.id}-${shift}`}
-                  center={position}
-                  radius={6}
-                  eventHandlers={{ click: () => onSelectServer(server.id) }}
-                  pathOptions={{
-                    color: theme === 'light' ? '#fffdf6' : '#211f1a',
-                    fillColor: server.online
-                      ? (theme === 'light' ? '#74ad82' : '#9ec989')
-                      : (theme === 'light' ? '#d97974' : '#e58b83'),
-                    fillOpacity: 1,
-                    weight: 2
-                  }}
-                >
-                  <LeafletTooltip className="map-node-tooltip" direction="top" offset={[0, -10]} opacity={1}>
-                    <b>{server.name}</b>
-                    <span>{location}</span>
-                    <span>IP：{bSegmentIp}</span>
-                  </LeafletTooltip>
-                  <Popup>
-                    <b>{server.name}</b><br />
-                    {serverLocationLabel(server, t, t('未知位置'))}<br />
-                    {server.online ? t('在线') : t('离线')}
-                  </Popup>
-                </CircleMarker>
+                <Fragment key={`cluster-node-${cluster.key}-${shift}`}>
+                  {cluster.servers.length > 1 && (
+                    <CircleMarker
+                      center={position}
+                      radius={Math.min(20, 11 + cluster.servers.length * 1.15)}
+                      interactive={false}
+                      pathOptions={{
+                        color: fillColor,
+                        fillColor,
+                        fillOpacity: 0.055,
+                        opacity: 0.36,
+                        weight: 1.15,
+                        dashArray: '4 7'
+                      }}
+                    />
+                  )}
+                  <CircleMarker
+                    center={position}
+                    radius={cluster.servers.length > 1 ? Math.min(11, 7 + cluster.servers.length * 0.75) : 6}
+                    eventHandlers={cluster.servers.length === 1 ? { click: () => onSelectServer(cluster.servers[0].id) } : undefined}
+                    pathOptions={{
+                      color: theme === 'light' ? '#fffdf6' : '#211f1a',
+                      fillColor,
+                      fillOpacity: 1,
+                      weight: cluster.servers.length > 1 ? 2.8 : 2
+                    }}
+                  >
+                    <LeafletTooltip className="map-node-tooltip map-cluster-tooltip" direction="top" offset={[0, -12]} opacity={1}>
+                      <b>{clusterLabel(cluster, t)}</b>
+                      <span>{location}</span>
+                      {cluster.servers.map((server) => (
+                        <span className="cluster-node-line" key={server.id}>
+                          <i className={server.online ? 'online' : 'offline'} />
+                          {server.name} · {server.online ? t('在线') : t('离线')} · {server.ip_masked || t('IP 待上报')}
+                        </span>
+                      ))}
+                    </LeafletTooltip>
+                    <Popup className="map-cluster-popup">
+                      {cluster.servers.length === 1 ? (
+                        <>
+                          <b>{cluster.servers[0].name}</b><br />
+                          {serverLocationLabel(cluster.servers[0], t, t('未知位置'))}<br />
+                          {cluster.servers[0].online ? t('在线') : t('离线')}
+                        </>
+                      ) : (
+                        <div className="map-cluster-picker">
+                          <b>{clusterLabel(cluster, t)}</b>
+                          <span>{t('选择要查看的节点')}</span>
+                          {cluster.servers.map((server) => (
+                            <button key={server.id} onClick={() => onSelectServer(server.id)}>
+                              <i className={server.online ? 'online' : 'offline'} />
+                              <span>{server.name}</span>
+                              <small>{server.ip_masked || t('IP 待上报')}</small>
+                            </button>
+                          ))}
+                        </div>
+                      )}
+                    </Popup>
+                  </CircleMarker>
+                </Fragment>
               );
             }))}
-            {center && points.filter((server) => server.online).map((server, index) => {
+            {center && clusters.filter((cluster) => cluster.status !== 'offline').map((cluster, index) => {
               const arc = greatCircleArc(
                 [center.latitude, center.longitude],
-                [Number(server.location.latitude), Number(server.location.longitude)]
+                [cluster.latitude, cluster.longitude]
               );
-              const color = theme === 'light' ? '#6aa8a5' : '#8ddad2';
+              const color = clusterLineColor(cluster.status, theme);
               return worldShifts.map((shift) => {
                 const shiftedArc = arc.map(([latitude, longitude]) => [latitude, longitude + shift] as Coordinate);
                 return (
-                <Fragment key={`line-${server.id}-${shift}`}>
+                <Fragment key={`line-${cluster.key}-${shift}`}>
                   <Polyline
                     interactive={false}
                     positions={shiftedArc}
-                    pathOptions={{ color, weight: 5, opacity: 0.07, lineCap: 'round', lineJoin: 'round' }}
+                    pathOptions={{ color, weight: cluster.servers.length > 1 ? 4.4 : 5, opacity: 0.07, lineCap: 'round', lineJoin: 'round' }}
                   />
                   <Polyline
                     interactive={false}
                     positions={shiftedArc}
-                    pathOptions={{ color, weight: 1.25, opacity: 0.62, lineCap: 'round', lineJoin: 'round' }}
+                    pathOptions={{ color, weight: cluster.servers.length > 1 ? 1.15 : 1.25, opacity: cluster.status === 'mixed' ? 0.72 : 0.62, lineCap: 'round', lineJoin: 'round' }}
                   />
                   <Polyline
                     interactive={false}
@@ -416,12 +552,12 @@ function WorldMapPanel({
                 );
               });
             })}
-            {center && points.filter((server) => !server.online).map((server, index) => {
+            {center && clusters.filter((cluster) => cluster.status === 'offline').map((cluster) => {
               const arc = greatCircleArc(
                 [center.latitude, center.longitude],
-                [Number(server.location.latitude), Number(server.location.longitude)]
+                [cluster.latitude, cluster.longitude]
               );
-              const color = theme === 'light' ? '#d97974' : '#e58b83';
+              const color = clusterLineColor(cluster.status, theme);
               return worldShifts.map((shift) => {
                 const shiftedArc = arc.map(([latitude, longitude]) => [latitude, longitude + shift] as Coordinate);
                 const crossPoints = [0.36, 0.58, 0.8].map((ratio) => {
@@ -429,11 +565,11 @@ function WorldMapPanel({
                   return [latitude, longitude] as [number, number];
                 });
                 return (
-                  <Fragment key={`offline-line-${server.id}-${shift}`}>
+                  <Fragment key={`offline-line-${cluster.key}-${shift}`}>
                     <Polyline
                       interactive={false}
                       positions={shiftedArc}
-                      pathOptions={{ color, weight: 4.4, opacity: 0.09, lineCap: 'round', lineJoin: 'round' }}
+                      pathOptions={{ color, weight: cluster.servers.length > 1 ? 4 : 4.4, opacity: 0.09, lineCap: 'round', lineJoin: 'round' }}
                     />
                     <Polyline
                       interactive={false}
@@ -450,7 +586,7 @@ function WorldMapPanel({
                     />
                     {crossPoints.map((position, breakIndex) => (
                       <Marker
-                        key={`offline-break-${server.id}-${shift}-${breakIndex}`}
+                        key={`offline-break-${cluster.key}-${shift}-${breakIndex}`}
                         position={position}
                         icon={offlineBreakIcon}
                         interactive={false}
@@ -469,9 +605,7 @@ function WorldMapPanel({
         )}
         {mode === '2d' && (
           <div className="map-attribution" aria-label={t('地图数据来源')}>
-            © <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noreferrer">OpenStreetMap</a>
-            <span>·</span>
-            © <a href="https://carto.com/attributions" target="_blank" rel="noreferrer">CARTO</a>
+            © <a href="https://www.esri.com/" target="_blank" rel="noreferrer">Esri</a>
           </div>
         )}
         <button className="map-reset-button" onClick={resetMap} title={t('复位到中心节点')}>
@@ -487,6 +621,7 @@ function WorldMapPanel({
         <div className="map-legend">
           <span><i className="legend-node online" /> {t('在线')}</span>
           <span><i className="legend-node offline" /> {t('离线')}</span>
+          {clusters.some((cluster) => cluster.status === 'mixed') && <span><i className="legend-node mixed" /> {t('部分异常')}</span>}
           {center && points.some((server) => !server.online) && <span><i className="legend-break" /> {t('异常连接')}</span>}
           {center && <span><i className="legend-node center" /> {center.name}</span>}
         </div>
@@ -699,51 +834,52 @@ function ServerRoster({
           {!expanded && <h2>{t('节点清单')}</h2>}
           <p>{t('显示 {count} / {total} 台', { count: filtered.length, total: servers.length })} · {t('每 {seconds} 秒动态刷新', { seconds: refreshIntervalSeconds })}</p>
         </div>
-        <div className="table-actions">
-          <label className="icon-select">
-            <Rows size={15} />
-            <select
-              value={groupFilter}
+      </div>
+      <div className="roster-toolbar">
+        <SelectDrawer
+          className="roster-filter-select roster-group-select"
+          icon={<Rows size={15} />}
+          value={groupFilter}
+          onChange={(next) => {
+            setGroupFilter(next);
+            window.localStorage.setItem('vps-monitor-group-filter', next);
+          }}
+          options={[
+            { value: 'all', label: t('全部分组') },
+            ...groupOptions.map((group) => ({ value: group.key, label: `${group.label} (${group.count})` }))
+          ]}
+        />
+        {groupFilter === 'all' && (
+          <label className="roster-check">
+            <input
+              type="checkbox"
+              checked={showGroupNames}
               onChange={(event) => {
-                setGroupFilter(event.target.value);
-                window.localStorage.setItem('vps-monitor-group-filter', event.target.value);
+                setShowGroupNames(event.target.checked);
+                window.localStorage.setItem('vps-monitor-show-group-names', event.target.checked ? '1' : '0');
               }}
-            >
-              <option value="all">{t('全部分组')}</option>
-              {groupOptions.map((group) => (
-                <option key={group.key} value={group.key}>{group.label} ({group.count})</option>
-              ))}
-            </select>
+            />
+            <span>{t('显示分组名')}</span>
           </label>
-          {groupFilter === 'all' && (
-            <label className="roster-check">
-              <input
-                type="checkbox"
-                checked={showGroupNames}
-                onChange={(event) => {
-                  setShowGroupNames(event.target.checked);
-                  window.localStorage.setItem('vps-monitor-show-group-names', event.target.checked ? '1' : '0');
-                }}
-              />
-              <span>{t('显示分组名')}</span>
-            </label>
-          )}
-          <label className="icon-select">
-            <Funnel size={15} />
-            <select value={status} onChange={(event) => setStatus(event.target.value as typeof status)}>
-              <option value="all">{t('全部状态')}</option>
-              <option value="online">{t('在线')}</option>
-              <option value="offline">{t('离线')}</option>
-            </select>
-          </label>
-          <div className="segmented icon-only">
-            <button className={view === 'table' ? 'active' : ''} onClick={() => { setView('table'); window.localStorage.setItem('vps-monitor-server-view', 'table'); }} title={t('列表视图')}>
-              <ListBullets size={17} />
-            </button>
-            <button className={view === 'cards' ? 'active' : ''} onClick={() => { setView('cards'); window.localStorage.setItem('vps-monitor-server-view', 'cards'); }} title={t('卡片视图')}>
-              <CardsThree size={17} />
-            </button>
-          </div>
+        )}
+        <SelectDrawer
+          className="roster-filter-select roster-status-select"
+          icon={<Funnel size={15} />}
+          value={status}
+          onChange={(next) => setStatus(next as typeof status)}
+          options={[
+            { value: 'all', label: t('全部状态') },
+            { value: 'online', label: t('在线') },
+            { value: 'offline', label: t('离线') }
+          ]}
+        />
+        <div className="segmented icon-only">
+          <button className={view === 'table' ? 'active' : ''} onClick={() => { setView('table'); window.localStorage.setItem('vps-monitor-server-view', 'table'); }} title={t('列表视图')}>
+            <ListBullets size={17} />
+          </button>
+          <button className={view === 'cards' ? 'active' : ''} onClick={() => { setView('cards'); window.localStorage.setItem('vps-monitor-server-view', 'cards'); }} title={t('卡片视图')}>
+            <CardsThree size={17} />
+          </button>
         </div>
       </div>
       {!filtered.length ? (
@@ -1126,6 +1262,9 @@ function PingPanel({
   const [displayMode, setDisplayMode] = useState<'latency' | 'loss' | 'both'>('latency');
   const [points, setPoints] = useState<PingPoint[]>([]);
   const [error, setError] = useState('');
+  const [legendExpanded, setLegendExpanded] = useState(false);
+  const [legendOverflow, setLegendOverflow] = useState(false);
+  const legendTargetsRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     if (!serverId && firstServer) setServerId(firstServer);
@@ -1149,6 +1288,10 @@ function PingPanel({
       })
       .catch((reason) => setError(reason.message));
   }, [demo, range, serverId, targetId]);
+
+  useEffect(() => {
+    setLegendExpanded(false);
+  }, [serverId, targetId]);
 
   const availableTargets = summary.ping_targets.filter((target) => !target.server_id || target.server_id === serverId);
   const series = useMemo(() => {
@@ -1191,26 +1334,57 @@ function PingPanel({
   const lossAverage = average(points
     .filter((point) => point.loss_rate != null)
     .map((point) => Number(point.loss_rate)));
+
+  useEffect(() => {
+    const element = legendTargetsRef.current;
+    if (!element || legendExpanded) return;
+    const updateOverflow = () => setLegendOverflow(element.scrollHeight > element.clientHeight + 1);
+    const frame = window.requestAnimationFrame(updateOverflow);
+    const observer = new ResizeObserver(updateOverflow);
+    observer.observe(element);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      observer.disconnect();
+    };
+  }, [legendExpanded, series]);
+
+  const selectorControls = (
+    <div className="ping-selectors">
+      <label>
+        <span>{t('服务器选择')}</span>
+        <SelectDrawer
+          className="ping-select-drawer"
+          value={serverId}
+          onChange={setServerId}
+          options={summary.servers.map((server) => ({ value: server.id, label: server.name }))}
+        />
+      </label>
+      <label>
+        <span>{t('目标选择')}</span>
+        <SelectDrawer
+          className="ping-select-drawer"
+          value={targetId}
+          onChange={setTargetId}
+          options={[
+            { value: '', label: t('全部目标') },
+            ...availableTargets.map((target) => ({ value: target.id, label: target.name }))
+          ]}
+        />
+      </label>
+    </div>
+  );
   return (
     <section className={`surface ping-surface ${expanded ? 'expanded' : ''} ${compact ? 'detail-compact' : ''}`}>
-      <div className="surface-header ping-header">
-        {!expanded && !compact && <div><h2>{t('延迟记录')}</h2></div>}
-        <div className="ping-selectors">
-          <label>
-            <span>{t('服务器选择')}</span>
-            <select value={serverId} onChange={(event) => setServerId(event.target.value)}>
-              {summary.servers.map((server) => <option key={server.id} value={server.id}>{server.name}</option>)}
-            </select>
-          </label>
-          <label>
-            <span>{t('目标选择')}</span>
-            <select value={targetId} onChange={(event) => setTargetId(event.target.value)}>
-              <option value="">{t('全部目标')}</option>
-              {availableTargets.map((target) => <option key={target.id} value={target.id}>{target.name}</option>)}
-            </select>
-          </label>
+      {!expanded && !compact ? (
+        <div className="surface-header ping-header">
+          <div><h2>{t('延迟记录')}</h2></div>
+          {selectorControls}
         </div>
-      </div>
+      ) : (
+        <div className="surface-header ping-header">
+          {selectorControls}
+        </div>
+      )}
       <div className="ping-meta">
         <div><span>{t('平均延迟')}</span><b>{points.length ? `${latencyAverage.toFixed(1)} ms` : '--'}</b></div>
         <div><span>{t('平均丢包')}</span><b className={lossAverage > 1 ? 'text-bad' : ''}>{points.length ? `${lossAverage.toFixed(2)}%` : '--'}</b></div>
@@ -1227,13 +1401,26 @@ function PingPanel({
       </div>
       {!!series.length && (
         <div className="ping-series-legend">
-          <div className="ping-target-legends">
-            {series.map((item) => (
-              <span key={item.key} title={[item.host, item.mode?.toUpperCase()].filter(Boolean).join(' · ')}>
-                <i style={{ background: item.color }} />
-                {item.name}
-              </span>
-            ))}
+          <div className="ping-legend-target-zone">
+            <div ref={legendTargetsRef} className={`ping-target-legends ${legendExpanded ? 'expanded' : ''}`}>
+              {series.map((item) => (
+                <span className="ping-target-legend" key={item.key} title={[item.name, item.host, item.mode?.toUpperCase()].filter(Boolean).join(' · ')}>
+                  <i style={{ background: item.color }} />
+                  <span className="ping-target-name">{item.name}</span>
+                </span>
+              ))}
+            </div>
+            {(legendOverflow || legendExpanded) && (
+              <button
+                className="ping-legend-toggle"
+                type="button"
+                aria-expanded={legendExpanded}
+                onClick={() => setLegendExpanded((value) => !value)}
+              >
+                {legendExpanded ? t('收起目标') : t('更多目标')}
+                {legendExpanded ? <CaretUp size={13} /> : <CaretDown size={13} />}
+              </button>
+            )}
           </div>
           <div className="ping-measure-legends">
             {(displayMode === 'latency' || displayMode === 'both') && <span><i className="solid" /> {t('延迟 ms')}</span>}

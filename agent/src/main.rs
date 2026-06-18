@@ -27,6 +27,15 @@ impl AgentConfig {
             .trim_end_matches('/')
             .to_string();
         let token = std::env::var("VPS_MONITOR_AGENT_TOKEN").context("VPS_MONITOR_AGENT_TOKEN 未设置")?;
+        let parsed_url = reqwest::Url::parse(&server_url).context("VPS_MONITOR_SERVER_URL 格式错误")?;
+        let is_local_http = parsed_url.scheme() == "http"
+            && matches!(parsed_url.host_str(), Some("localhost" | "127.0.0.1" | "::1"));
+        if parsed_url.scheme() != "https" && !is_local_http {
+            return Err(anyhow!("VPS_MONITOR_SERVER_URL 必须使用 HTTPS（仅本机回环地址允许 HTTP）"));
+        }
+        if token.len() < 32 || token.len() > 512 {
+            return Err(anyhow!("VPS_MONITOR_AGENT_TOKEN 长度不合法"));
+        }
         let host_root = PathBuf::from(std::env::var("VPS_MONITOR_HOST_ROOT").unwrap_or_else(|_| "/host".to_string()));
         let public_ip = std::env::var("VPS_MONITOR_PUBLIC_IP").ok().filter(|v| !v.trim().is_empty());
         Ok(Self {
@@ -181,8 +190,8 @@ async fn collect_payload(
     ping_results: Vec<PingResult>,
 ) -> anyhow::Result<MetricPayload> {
     let mem = read_memory()?;
-    let disk = read_disk(&config.host_root)?;
-    let net = read_network()?;
+    let disk = read_disk(Path::new("/"))?;
+    let net = read_network(&config.host_root)?;
     let load = read_load()?;
     Ok(MetricPayload {
         captured_at: Utc::now(),
@@ -250,9 +259,11 @@ async fn run_due_pings(targets: &[PingTarget], last_ping_at: &mut HashMap<String
 
 async fn tcp_ping(target: &PingTarget) -> anyhow::Result<f64> {
     let port = target.tcp_port.ok_or_else(|| anyhow!("TCP Ping 缺少端口"))?;
-    let addr = format!("{}:{}", target.host, port);
     let started = Instant::now();
-    timeout(Duration::from_millis(target.timeout_ms.max(100)), TcpStream::connect(addr))
+    timeout(
+        Duration::from_millis(target.timeout_ms.max(100)),
+        TcpStream::connect((target.host.as_str(), port)),
+    )
         .await
         .map_err(|_| anyhow!("TCP Ping 超时"))??;
     Ok(started.elapsed().as_secs_f64() * 1000.0)
@@ -268,6 +279,7 @@ async fn icmp_ping(target: &PingTarget) -> anyhow::Result<f64> {
             .arg("1")
             .arg("-W")
             .arg(timeout_secs)
+            .arg("--")
             .arg(&target.host)
             .output(),
     )
@@ -276,11 +288,12 @@ async fn icmp_ping(target: &PingTarget) -> anyhow::Result<f64> {
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
-        return Err(anyhow!(
+        let detail = format!(
             "{}{}",
             stdout.trim(),
             if stderr.trim().is_empty() { "" } else { stderr.trim() }
-        ));
+        );
+        return Err(anyhow!("{}", detail.chars().take(500).collect::<String>()));
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
     parse_ping_latency(&stdout).ok_or_else(|| anyhow!("无法解析 ping 延迟"))
@@ -401,8 +414,10 @@ struct NetworkInfo {
     tx_bytes: i64,
 }
 
-fn read_network() -> anyhow::Result<NetworkInfo> {
-    let content = std::fs::read_to_string("/proc/net/dev")?;
+fn read_network(host_root: &Path) -> anyhow::Result<NetworkInfo> {
+    let host_path = host_root.join("proc/net/dev");
+    let content = std::fs::read_to_string(&host_path)
+        .or_else(|_| std::fs::read_to_string("/proc/net/dev"))?;
     let mut rx = 0_i64;
     let mut tx = 0_i64;
     for line in content.lines().skip(2) {
@@ -471,4 +486,3 @@ mod tests {
         assert_eq!(parse_ping_latency(out), Some(12.34));
     }
 }
-

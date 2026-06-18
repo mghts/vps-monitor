@@ -1,9 +1,10 @@
 use std::{
+    collections::{HashMap, VecDeque},
     io::Read,
     net::{IpAddr, SocketAddr},
     path::{Path as FsPath, PathBuf},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::Context;
@@ -13,8 +14,8 @@ use argon2::{
 };
 use axum::{
     body::Body,
-    extract::{DefaultBodyLimit, Multipart, Path, Query, State},
-    http::{header, HeaderMap, HeaderValue, Request, StatusCode},
+    extract::{ConnectInfo, DefaultBodyLimit, Multipart, Path, Query, State},
+    http::{header, HeaderMap, HeaderName, HeaderValue, Request, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, patch, post},
@@ -29,7 +30,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use sqlx::{postgres::PgPoolOptions, PgPool, Row};
-use tokio::{net::TcpListener, sync::RwLock};
+use tokio::{net::{lookup_host, TcpListener}, sync::{Mutex, RwLock}};
 use tower_http::{
     services::{ServeDir, ServeFile},
     trace::TraceLayer,
@@ -38,9 +39,15 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 const DEFAULT_GEOIP_MMDB_URL: &str = "https://cdn.jsdelivr.net/npm/geolite2-city/GeoLite2-City.mmdb.gz";
-const MAX_GEOIP_DOWNLOAD_BYTES: usize = 300 * 1024 * 1024;
-const MAX_GEOIP_DATABASE_BYTES: usize = 700 * 1024 * 1024;
+const MAX_GEOIP_DOWNLOAD_BYTES: usize = 128 * 1024 * 1024;
+const MAX_GEOIP_DATABASE_BYTES: usize = 256 * 1024 * 1024;
 const MAX_BACKGROUND_IMAGE_BYTES: usize = 12 * 1024 * 1024;
+const MAX_API_JSON_BYTES: usize = 256 * 1024;
+const MAX_AGENT_PING_RESULTS: usize = 64;
+const AUTH_RATE_LIMIT_ATTEMPTS: usize = 10;
+const AUTH_RATE_LIMIT_WINDOW: Duration = Duration::from_secs(15 * 60);
+const AGENT_RATE_LIMIT_REQUESTS: usize = 120;
+const AGENT_RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
 const CENTER_AUTO_LOCATION_TTL_HOURS: i64 = 6;
 const MIN_PUBLIC_REFRESH_SECONDS: i64 = 2;
 const MAX_PUBLIC_REFRESH_SECONDS: i64 = 60;
@@ -53,6 +60,68 @@ struct AppState {
     config: Arc<Config>,
     http: reqwest::Client,
     geoip: Arc<RwLock<Option<GeoIp>>>,
+    auth_limiter: Arc<AuthRateLimiter>,
+    agent_limiter: Arc<AgentRateLimiter>,
+    dummy_password_hash: Arc<String>,
+}
+
+#[derive(Default)]
+struct AuthRateLimiter {
+    failures: Mutex<HashMap<String, VecDeque<Instant>>>,
+}
+
+impl AuthRateLimiter {
+    async fn check(&self, key: &str) -> Result<(), AppError> {
+        let mut failures = self.failures.lock().await;
+        let now = Instant::now();
+        let attempts = failures.entry(key.to_string()).or_default();
+        attempts.retain(|at| now.duration_since(*at) < AUTH_RATE_LIMIT_WINDOW);
+        if attempts.len() >= AUTH_RATE_LIMIT_ATTEMPTS {
+            return Err(AppError::too_many_requests("尝试次数过多，请 15 分钟后重试"));
+        }
+        Ok(())
+    }
+
+    async fn record_failure(&self, key: &str) {
+        let mut failures = self.failures.lock().await;
+        if failures.len() >= 10_000 {
+            let now = Instant::now();
+            failures.retain(|_, attempts| {
+                attempts.retain(|at| now.duration_since(*at) < AUTH_RATE_LIMIT_WINDOW);
+                !attempts.is_empty()
+            });
+        }
+        failures.entry(key.to_string()).or_default().push_back(Instant::now());
+    }
+
+    async fn clear(&self, key: &str) {
+        self.failures.lock().await.remove(key);
+    }
+}
+
+#[derive(Default)]
+struct AgentRateLimiter {
+    requests: Mutex<HashMap<Uuid, VecDeque<Instant>>>,
+}
+
+impl AgentRateLimiter {
+    async fn check_and_record(&self, server_id: Uuid) -> Result<(), AppError> {
+        let mut requests = self.requests.lock().await;
+        let now = Instant::now();
+        if requests.len() >= 10_000 {
+            requests.retain(|_, timestamps| {
+                timestamps.retain(|at| now.duration_since(*at) < AGENT_RATE_LIMIT_WINDOW);
+                !timestamps.is_empty()
+            });
+        }
+        let timestamps = requests.entry(server_id).or_default();
+        timestamps.retain(|at| now.duration_since(*at) < AGENT_RATE_LIMIT_WINDOW);
+        if timestamps.len() >= AGENT_RATE_LIMIT_REQUESTS {
+            return Err(AppError::too_many_requests("Agent 请求过于频繁"));
+        }
+        timestamps.push_back(now);
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -67,6 +136,7 @@ struct Config {
     agent_release_repository: String,
     agent_release_tag: String,
     cookie_secure: bool,
+    trust_proxy_headers: bool,
     geoip_mmdb_path: PathBuf,
     background_dir: PathBuf,
 }
@@ -80,10 +150,14 @@ impl Config {
             .context("BIND_ADDR 格式错误")?;
         let database_url = std::env::var("DATABASE_URL").context("DATABASE_URL 未设置")?;
         let setup_token = std::env::var("SETUP_TOKEN").context("SETUP_TOKEN 未设置")?;
+        if setup_token.chars().count() < 32 {
+            anyhow::bail!("SETUP_TOKEN 至少需要 32 个字符");
+        }
         let base_url = std::env::var("BASE_URL")
             .unwrap_or_else(|_| format!("http://{}", bind_addr))
             .trim_end_matches('/')
             .to_string();
+        validate_secure_http_url("BASE_URL", &base_url)?;
         let static_dir = PathBuf::from(std::env::var("STATIC_DIR").unwrap_or_else(|_| "web/dist".to_string()));
         let agent_image = std::env::var("AGENT_IMAGE").unwrap_or_else(|_| "vps-monitor-agent:latest".to_string());
         let agent_installer_url = std::env::var("AGENT_INSTALLER_URL")
@@ -91,6 +165,7 @@ impl Config {
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| format!("{}/install.sh", base_url));
+        validate_secure_http_url("AGENT_INSTALLER_URL", &agent_installer_url)?;
         let agent_release_repository = std::env::var("AGENT_RELEASE_REPOSITORY")
             .unwrap_or_default()
             .trim()
@@ -114,6 +189,9 @@ impl Config {
         let cookie_secure = std::env::var("COOKIE_SECURE")
             .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes"))
             .unwrap_or_else(|_| base_url.starts_with("https://"));
+        let trust_proxy_headers = std::env::var("TRUST_PROXY_HEADERS")
+            .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes"))
+            .unwrap_or(false);
         Ok(Self {
             bind_addr,
             database_url,
@@ -125,10 +203,34 @@ impl Config {
             agent_release_repository,
             agent_release_tag,
             cookie_secure,
+            trust_proxy_headers,
             geoip_mmdb_path,
             background_dir,
         })
     }
+}
+
+fn validate_secure_http_url(name: &str, value: &str) -> anyhow::Result<()> {
+    let parsed = reqwest::Url::parse(value).with_context(|| format!("{} 格式错误", name))?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("{} 缺少主机名", name))?
+        .trim_matches(|character| character == '[' || character == ']');
+    let is_loopback = host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false);
+    if parsed.scheme() != "https" && !(parsed.scheme() == "http" && is_loopback) {
+        anyhow::bail!("{} 必须使用 HTTPS（仅本机回环地址允许 HTTP）", name);
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        anyhow::bail!("{} 不能包含用户名或密码", name);
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        anyhow::bail!("{} 不能包含查询参数或片段", name);
+    }
+    Ok(())
 }
 
 struct GeoIp {
@@ -208,6 +310,12 @@ async fn main() -> anyhow::Result<()> {
         config: config.clone(),
         http: reqwest::Client::builder().timeout(Duration::from_secs(10)).build()?,
         geoip,
+        auth_limiter: Arc::new(AuthRateLimiter::default()),
+        agent_limiter: Arc::new(AgentRateLimiter::default()),
+        dummy_password_hash: Arc::new(
+            hash_password("not-a-real-password-for-timing-only")
+                .map_err(|err| anyhow::anyhow!(err.message))?,
+        ),
     };
 
     spawn_housekeeping(state.clone());
@@ -215,7 +323,7 @@ async fn main() -> anyhow::Result<()> {
     let app = build_router(state);
     let listener = TcpListener::bind(config.bind_addr).await?;
     info!("VPS Monitor server listening on {}", config.bind_addr);
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;
     Ok(())
 }
 
@@ -230,12 +338,13 @@ fn build_router(state: AppState) -> Router {
         .route("/settings", get(admin_get_settings).put(admin_update_settings))
         .route(
             "/settings/background",
-            post(admin_upload_background).delete(admin_delete_background),
+            post(admin_upload_background)
+                .delete(admin_delete_background)
+                .layer(DefaultBodyLimit::max(MAX_BACKGROUND_IMAGE_BYTES + 1024 * 1024)),
         )
         .route("/settings/geoip/test", post(admin_test_geoip))
         .route("/settings/geoip/update", post(admin_refresh_geoip))
         .route("/alerts", get(admin_list_alerts))
-        .layer(DefaultBodyLimit::max(MAX_BACKGROUND_IMAGE_BYTES + 1024 * 1024))
         .layer(middleware::from_fn_with_state(state.clone(), admin_auth));
 
     let api = Router::new()
@@ -250,7 +359,8 @@ fn build_router(state: AppState) -> Router {
         .route("/public/ping-series", get(public_ping_series))
         .route("/agent/config", get(agent_config))
         .route("/agent/metrics", post(agent_metrics))
-        .nest("/admin", admin_routes);
+        .nest("/admin", admin_routes)
+        .layer(DefaultBodyLimit::max(MAX_API_JSON_BYTES));
 
     let index = state.config.static_dir.join("index.html");
     Router::new()
@@ -259,8 +369,50 @@ fn build_router(state: AppState) -> Router {
         .nest("/api", api)
         .nest_service("/uploads", ServeDir::new(state.config.background_dir.clone()))
         .fallback_service(ServeDir::new(state.config.static_dir.clone()).fallback(ServeFile::new(index)))
+        .layer(middleware::from_fn(security_headers))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
+}
+
+async fn security_headers(req: Request<Body>, next: Next) -> Response {
+    let path = req.uri().path().to_string();
+    let mut response = next.run(req).await;
+    let headers = response.headers_mut();
+    headers.insert(
+        HeaderName::from_static("x-content-type-options"),
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        HeaderName::from_static("strict-transport-security"),
+        HeaderValue::from_static("max-age=31536000"),
+    );
+    headers.insert(
+        HeaderName::from_static("x-frame-options"),
+        HeaderValue::from_static("DENY"),
+    );
+    headers.insert(
+        HeaderName::from_static("referrer-policy"),
+        HeaderValue::from_static("no-referrer"),
+    );
+    headers.insert(
+        HeaderName::from_static("permissions-policy"),
+        HeaderValue::from_static("camera=(), microphone=(), geolocation=()"),
+    );
+    headers.insert(
+        HeaderName::from_static("content-security-policy"),
+        HeaderValue::from_static(
+            "base-uri 'self'; default-src 'self'; frame-ancestors 'none'; form-action 'self'; img-src 'self' data: blob: https://server.arcgisonline.com; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; font-src 'self' data:",
+        ),
+    );
+    if path.starts_with("/api/admin/")
+        || path.starts_with("/api/auth/")
+        || path.starts_with("/api/bootstrap/")
+        || path.starts_with("/api/agent/")
+    {
+        headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        headers.insert(HeaderName::from_static("pragma"), HeaderValue::from_static("no-cache"));
+    }
+    response
 }
 
 async fn health() -> Json<Value> {
@@ -307,24 +459,36 @@ struct RegisterRequest {
 
 async fn bootstrap_register(
     State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(req): Json<RegisterRequest>,
 ) -> Result<Json<Value>, AppError> {
+    let rate_key = auth_rate_key("register", &headers, peer, state.config.trust_proxy_headers);
+    state.auth_limiter.check(&rate_key).await?;
+    if req.setup_token != state.config.setup_token {
+        state.auth_limiter.record_failure(&rate_key).await;
+        return Err(AppError::unauthorized("SETUP_TOKEN 不正确"));
+    }
+    validate_username_password(&req.username, &req.password)?;
+
+    let mut tx = state.pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(862734901)")
+        .execute(&mut *tx)
+        .await?;
     let admin_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM admins")
-        .fetch_one(&state.pool)
+        .fetch_one(&mut *tx)
         .await?;
     if admin_count > 0 {
         return Err(AppError::bad_request("管理员已存在，注册入口已关闭"));
     }
-    if req.setup_token != state.config.setup_token {
-        return Err(AppError::unauthorized("SETUP_TOKEN 不正确"));
-    }
-    validate_username_password(&req.username, &req.password)?;
     let hash = hash_password(&req.password)?;
     sqlx::query("INSERT INTO admins(username, password_hash) VALUES ($1, $2)")
         .bind(req.username.trim())
         .bind(hash)
-        .execute(&state.pool)
+        .execute(&mut *tx)
         .await?;
+    tx.commit().await?;
+    state.auth_limiter.clear(&rate_key).await;
     Ok(Json(json!({"ok": true})))
 }
 
@@ -343,9 +507,14 @@ struct ResetPasswordRequest {
 
 async fn reset_admin_password(
     State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(req): Json<ResetPasswordRequest>,
 ) -> Result<Json<Value>, AppError> {
+    let rate_key = auth_rate_key("reset", &headers, peer, state.config.trust_proxy_headers);
+    state.auth_limiter.check(&rate_key).await?;
     if req.setup_token != state.config.setup_token {
+        state.auth_limiter.record_failure(&rate_key).await;
         return Err(AppError::unauthorized("SETUP_TOKEN 不正确"));
     }
     validate_username_password(&req.username, &req.password)?;
@@ -369,23 +538,34 @@ async fn reset_admin_password(
         .execute(&state.pool)
         .await?;
 
+    state.auth_limiter.clear(&rate_key).await;
     Ok(Json(json!({"ok": true})))
 }
 
 async fn login(
     State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(req): Json<LoginRequest>,
 ) -> Result<Response, AppError> {
+    validate_login_input(&req.username, &req.password)?;
+    let rate_key = auth_rate_key("login", &headers, peer, state.config.trust_proxy_headers);
+    state.auth_limiter.check(&rate_key).await?;
     let row = sqlx::query("SELECT id, password_hash FROM admins WHERE username = $1")
         .bind(req.username.trim())
         .fetch_optional(&state.pool)
         .await?;
-    let Some(row) = row else {
+    let password_hash = row
+        .as_ref()
+        .map(|value| value.get::<String, _>("password_hash"))
+        .unwrap_or_else(|| state.dummy_password_hash.as_ref().clone());
+    let valid = verify_password_matches(&req.password, &password_hash);
+    if !valid || row.is_none() {
+        state.auth_limiter.record_failure(&rate_key).await;
         return Err(AppError::unauthorized("用户名或密码错误"));
-    };
+    }
+    let row = row.expect("row was checked above");
     let admin_id: Uuid = row.get("id");
-    let password_hash: String = row.get("password_hash");
-    verify_password(&req.password, &password_hash)?;
 
     let token = random_token();
     let token_hash = hash_secret(&token);
@@ -398,6 +578,7 @@ async fn login(
     .bind(expires_at)
     .execute(&state.pool)
     .await?;
+    state.auth_limiter.clear(&rate_key).await;
 
     let secure = if state.config.cookie_secure { "; Secure" } else { "" };
     let cookie = format!(
@@ -471,10 +652,8 @@ async fn admin_create_server(
     State(state): State<AppState>,
     Json(req): Json<CreateServerRequest>,
 ) -> Result<Json<Value>, AppError> {
-    let name = req.name.trim();
-    if name.is_empty() {
-        return Err(AppError::bad_request("服务器名称不能为空"));
-    }
+    let name = validate_required_text("服务器名称", &req.name, 100)?;
+    let note = validate_optional_text("服务器备注", req.note.as_deref(), 2000)?;
     let public_ip = req
         .public_ip
         .as_deref()
@@ -499,7 +678,7 @@ async fn admin_create_server(
          RETURNING id",
     )
     .bind(name)
-    .bind(req.note.unwrap_or_default())
+    .bind(note)
     .bind(server_group)
     .bind(token_hash)
     .bind(public_ip.clone())
@@ -621,16 +800,18 @@ async fn admin_update_server(
             return Err(AppError::bad_request("traffic_reset_day 必须在 1-28 之间"));
         }
     }
+    if req.traffic_limit_bytes.flatten().is_some_and(|value| value < 0) {
+        return Err(AppError::bad_request("traffic_limit_bytes 不能为负数"));
+    }
     let current = sqlx::query("SELECT * FROM servers WHERE id = $1")
         .bind(id)
         .fetch_optional(&state.pool)
         .await?
         .ok_or_else(|| AppError::not_found("服务器不存在"))?;
     let name: String = req.name.unwrap_or_else(|| current.get("name"));
-    if name.trim().is_empty() {
-        return Err(AppError::bad_request("服务器名称不能为空"));
-    }
+    let name = validate_required_text("服务器名称", &name, 100)?;
     let note: String = req.note.unwrap_or_else(|| current.get("note"));
+    let note = validate_optional_text("服务器备注", Some(&note), 2000)?;
     let server_group: String = match req.server_group {
         Some(value) => clean_server_group(Some(&value))?,
         None => current.try_get("server_group").unwrap_or_default(),
@@ -659,6 +840,10 @@ async fn admin_update_server(
         .unwrap_or_else(|| current.try_get("location_city").ok());
     let latitude: Option<f64> = req.latitude.unwrap_or_else(|| current.try_get("latitude").ok());
     let longitude: Option<f64> = req.longitude.unwrap_or_else(|| current.try_get("longitude").ok());
+    validate_optional_text("国家/地区", location_country.as_deref(), 100)?;
+    validate_optional_text("省/州", location_region.as_deref(), 100)?;
+    validate_optional_text("城市", location_city.as_deref(), 100)?;
+    validate_coordinates(latitude, longitude)?;
 
     sqlx::query(
         r#"
@@ -671,7 +856,7 @@ async fn admin_update_server(
         "#,
     )
     .bind(id)
-    .bind(name.trim())
+    .bind(name)
     .bind(note)
     .bind(server_group)
     .bind(enabled)
@@ -880,9 +1065,10 @@ async fn admin_update_settings(
     Json(req): Json<UpdateSettingsRequest>,
 ) -> Result<Json<Value>, AppError> {
     if let Some(telegram) = req.telegram {
-        upsert_setting(&state.pool, "telegram", telegram).await?;
+        upsert_setting(&state.pool, "telegram", validate_telegram_settings(&telegram)?).await?;
     }
     if let Some(public) = req.public {
+        validate_public_settings(&public)?;
         upsert_setting(&state.pool, "public", sanitize_public_settings(public)).await?;
     }
     if let Some(geoip) = req.geoip {
@@ -902,6 +1088,7 @@ async fn admin_update_settings(
     }
     if let Some(rules) = req.alert_rules {
         for rule in rules {
+            validate_alert_rule(&rule)?;
             sqlx::query(
                 "UPDATE alert_rules SET enabled=$2, threshold=$3, duration_seconds=$4, repeat_seconds=$5, updated_at=now() WHERE key=$1",
             )
@@ -928,6 +1115,13 @@ fn sanitize_public_settings(mut value: Value) -> Value {
         .clamp(MIN_PUBLIC_REFRESH_SECONDS, MAX_PUBLIC_REFRESH_SECONDS);
     if let Value::Object(ref mut obj) = value {
         obj.insert("refresh_interval_seconds".to_string(), json!(refresh));
+        if let Some(background) = obj.get_mut("background").and_then(Value::as_object_mut) {
+            let image_url = background.get("image_url").and_then(Value::as_str).unwrap_or("");
+            if !image_url.is_empty() && !is_background_image_url(image_url) {
+                background.insert("image_url".to_string(), json!(""));
+                background.insert("enabled".to_string(), json!(false));
+            }
+        }
     }
     value
 }
@@ -1196,7 +1390,12 @@ async fn public_summary(State(state): State<AppState>) -> Result<Json<Value>, Ap
         r#"
         SELECT DISTINCT ON (pt.id) pt.id, pt.name, pt.host, pt.mode, pt.server_id
         FROM ping_targets pt
+        LEFT JOIN servers s ON s.id = pt.server_id
         WHERE pt.enabled = true
+          AND (
+            pt.scope = 'global'
+            OR (s.enabled = true AND s.public_visible = true)
+          )
         ORDER BY pt.id
         "#,
     )
@@ -1242,15 +1441,7 @@ async fn public_server_history(
     Path(id): Path<Uuid>,
     Query(q): Query<MetricHistoryQuery>,
 ) -> Result<Json<Value>, AppError> {
-    let visible = sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS(SELECT 1 FROM servers WHERE id=$1 AND enabled=true AND public_visible=true)",
-    )
-    .bind(id)
-    .fetch_one(&state.pool)
-    .await?;
-    if !visible {
-        return Err(AppError::not_found("服务器不存在或未公开"));
-    }
+    ensure_public_server_visible(&state.pool, id).await?;
 
     let range = q.range.as_deref().unwrap_or("24h");
     let since = match range {
@@ -1295,12 +1486,14 @@ async fn public_ping_series(
     State(state): State<AppState>,
     Query(q): Query<PingSeriesQuery>,
 ) -> Result<Json<Value>, AppError> {
+    ensure_public_server_visible(&state.pool, q.server_id).await?;
+
     let range = q.range.as_deref().unwrap_or("1h");
     let (since, source) = match range {
         "1h" => (Utc::now() - ChronoDuration::hours(1), "raw"),
         "6h" => (Utc::now() - ChronoDuration::hours(6), "raw"),
-        "24h" => (Utc::now() - ChronoDuration::hours(24), "raw"),
-        "7d" => (Utc::now() - ChronoDuration::days(7), "raw"),
+        "24h" => (Utc::now() - ChronoDuration::hours(24), "5m"),
+        "7d" => (Utc::now() - ChronoDuration::days(7), "5m"),
         "30d" => (Utc::now() - ChronoDuration::days(30), "5m"),
         "180d" => (Utc::now() - ChronoDuration::days(180), "1h"),
         "365d" => (Utc::now() - ChronoDuration::days(365), "1h"),
@@ -1310,18 +1503,20 @@ async fn public_ping_series(
         "raw" => {
             sqlx::query(
                 r#"
-                SELECT checked_at AS ts,
-                       ping_target_id,
-                       target_name,
-                       host,
-                       mode,
-                       latency_ms AS avg_latency_ms,
-                       CASE WHEN success THEN 1 ELSE 0 END AS success_count,
-                       CASE WHEN success THEN 0 ELSE 1 END AS loss_count,
+                SELECT ps.checked_at AS ts,
+                       ps.ping_target_id,
+                       ps.target_name,
+                       ps.host,
+                       ps.mode,
+                       ps.latency_ms AS avg_latency_ms,
+                       CASE WHEN ps.success THEN 1 ELSE 0 END AS success_count,
+                       CASE WHEN ps.success THEN 0 ELSE 1 END AS loss_count,
                        1 AS sample_count
-                FROM ping_samples
-                WHERE server_id=$1 AND checked_at >= $2 AND ($3::uuid IS NULL OR ping_target_id=$3)
-                ORDER BY checked_at ASC
+                FROM ping_samples ps
+                JOIN ping_targets pt ON pt.id=ps.ping_target_id
+                  AND pt.enabled=true AND (pt.scope='global' OR pt.server_id=$1)
+                WHERE ps.server_id=$1 AND ps.checked_at >= $2 AND ($3::uuid IS NULL OR ps.ping_target_id=$3)
+                ORDER BY ps.checked_at ASC
                 "#,
             )
             .bind(q.server_id)
@@ -1333,11 +1528,13 @@ async fn public_ping_series(
         "5m" => {
             sqlx::query(
                 r#"
-                SELECT bucket_at AS ts, ping_target_id, target_name, host, mode,
-                       avg_latency_ms, success_count, loss_count, sample_count
-                FROM ping_rollups_5m
-                WHERE server_id=$1 AND bucket_at >= $2 AND ($3::uuid IS NULL OR ping_target_id=$3)
-                ORDER BY bucket_at ASC
+                SELECT pr.bucket_at AS ts, pr.ping_target_id, pr.target_name, pr.host, pr.mode,
+                       pr.avg_latency_ms, pr.success_count, pr.loss_count, pr.sample_count
+                FROM ping_rollups_5m pr
+                JOIN ping_targets pt ON pt.id=pr.ping_target_id
+                  AND pt.enabled=true AND (pt.scope='global' OR pt.server_id=$1)
+                WHERE pr.server_id=$1 AND pr.bucket_at >= $2 AND ($3::uuid IS NULL OR pr.ping_target_id=$3)
+                ORDER BY pr.bucket_at ASC
                 "#,
             )
             .bind(q.server_id)
@@ -1349,11 +1546,13 @@ async fn public_ping_series(
         _ => {
             sqlx::query(
                 r#"
-                SELECT bucket_at AS ts, ping_target_id, target_name, host, mode,
-                       avg_latency_ms, success_count, loss_count, sample_count
-                FROM ping_rollups_1h
-                WHERE server_id=$1 AND bucket_at >= $2 AND ($3::uuid IS NULL OR ping_target_id=$3)
-                ORDER BY bucket_at ASC
+                SELECT pr.bucket_at AS ts, pr.ping_target_id, pr.target_name, pr.host, pr.mode,
+                       pr.avg_latency_ms, pr.success_count, pr.loss_count, pr.sample_count
+                FROM ping_rollups_1h pr
+                JOIN ping_targets pt ON pt.id=pr.ping_target_id
+                  AND pt.enabled=true AND (pt.scope='global' OR pt.server_id=$1)
+                WHERE pr.server_id=$1 AND pr.bucket_at >= $2 AND ($3::uuid IS NULL OR pr.ping_target_id=$3)
+                ORDER BY pr.bucket_at ASC
                 "#,
             )
             .bind(q.server_id)
@@ -1391,9 +1590,28 @@ async fn public_ping_series(
     Ok(Json(json!({"range": range, "source": source, "points": points})))
 }
 
-async fn agent_config(State(state): State<AppState>, headers: HeaderMap) -> Result<Json<Value>, AppError> {
-    let server = authenticate_agent(&state.pool, &headers).await?;
+async fn ensure_public_server_visible(pool: &PgPool, id: Uuid) -> Result<(), AppError> {
+    let visible = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM servers WHERE id=$1 AND enabled=true AND public_visible=true)",
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await?;
+    if visible {
+        Ok(())
+    } else {
+        Err(AppError::not_found("服务器不存在或未公开"))
+    }
+}
+
+async fn agent_config(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    let server = authenticate_agent_request(&state, &headers, peer).await?;
     let server_id: Uuid = server.get("id");
+    state.agent_limiter.check_and_record(server_id).await?;
     let ping_mode: String = server.get("ping_mode");
     let rows = if ping_mode == "override" {
         sqlx::query("SELECT * FROM ping_targets WHERE enabled=true AND server_id=$1 ORDER BY created_at ASC")
@@ -1465,9 +1683,6 @@ struct SystemInfoPayload {
 #[derive(Deserialize)]
 struct PingResultPayload {
     target_id: Option<Uuid>,
-    target_name: String,
-    host: String,
-    mode: String,
     checked_at: Option<DateTime<Utc>>,
     success: bool,
     latency_ms: Option<f64>,
@@ -1476,18 +1691,24 @@ struct PingResultPayload {
 
 async fn agent_metrics(
     State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
-    Json(payload): Json<AgentMetricPayload>,
+    Json(mut payload): Json<AgentMetricPayload>,
 ) -> Result<Json<Value>, AppError> {
-    let server = authenticate_agent(&state.pool, &headers).await?;
+    let server = authenticate_agent_request(&state, &headers, peer).await?;
     let server_id: Uuid = server.get("id");
+    state.agent_limiter.check_and_record(server_id).await?;
     let now = Utc::now();
-    let captured_at = payload.captured_at.unwrap_or(now);
+    let captured_at = bounded_agent_timestamp(payload.captured_at, now);
     let public_ip = payload
         .system
         .public_ip
-        .clone()
-        .or_else(|| forwarded_ip(&headers));
+        .as_deref()
+        .and_then(valid_public_ip)
+        .or_else(|| request_public_ip(&headers, peer, state.config.trust_proxy_headers));
+    payload.system_info = sanitize_system_info(payload.system_info);
+    let memory_total = payload.system.memory_total_bytes.max(0);
+    let disk_total = payload.system.disk_total_bytes.max(0);
 
     sqlx::query(
         r#"
@@ -1502,16 +1723,16 @@ async fn agent_metrics(
     .bind(server_id)
     .bind(captured_at)
     .bind(clamp_percent(payload.system.cpu_usage))
-    .bind(payload.system.memory_total_bytes.max(0))
-    .bind(payload.system.memory_used_bytes.max(0))
-    .bind(payload.system.disk_total_bytes.max(0))
-    .bind(payload.system.disk_used_bytes.max(0))
+    .bind(memory_total)
+    .bind(payload.system.memory_used_bytes.max(0).min(memory_total))
+    .bind(disk_total)
+    .bind(payload.system.disk_used_bytes.max(0).min(disk_total))
     .bind(payload.system.net_rx_bytes.max(0))
     .bind(payload.system.net_tx_bytes.max(0))
     .bind(payload.system.uptime_seconds.max(0))
-    .bind(payload.system.load1.max(0.0))
-    .bind(payload.system.load5.max(0.0))
-    .bind(payload.system.load15.max(0.0))
+    .bind(finite_nonnegative(payload.system.load1))
+    .bind(finite_nonnegative(payload.system.load5))
+    .bind(finite_nonnegative(payload.system.load15))
     .bind(public_ip.clone())
     .execute(&state.pool)
     .await?;
@@ -1526,10 +1747,37 @@ async fn agent_metrics(
     update_traffic(&state.pool, &server, &payload.system).await?;
 
     if let Some(results) = payload.ping_results {
-        for ping in results {
-            if ping.mode != "icmp" && ping.mode != "tcp" {
-                continue;
-            }
+        let allowed_rows = if server.get::<String, _>("ping_mode") == "override" {
+            sqlx::query("SELECT id, name, host, mode FROM ping_targets WHERE enabled=true AND scope='server' AND server_id=$1")
+                .bind(server_id)
+                .fetch_all(&state.pool)
+                .await?
+        } else {
+            sqlx::query("SELECT id, name, host, mode FROM ping_targets WHERE enabled=true AND (scope='global' OR (scope='server' AND server_id=$1))")
+                .bind(server_id)
+                .fetch_all(&state.pool)
+                .await?
+        };
+        let allowed = allowed_rows
+            .into_iter()
+            .map(|row| {
+                (
+                    row.get::<Uuid, _>("id"),
+                    (
+                        row.get::<String, _>("name"),
+                        row.get::<String, _>("host"),
+                        row.get::<String, _>("mode"),
+                    ),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        for ping in results.into_iter().take(MAX_AGENT_PING_RESULTS) {
+            let Some(target_id) = ping.target_id else { continue };
+            let Some((target_name, host, mode)) = allowed.get(&target_id) else { continue };
+            let latency = ping
+                .latency_ms
+                .filter(|value| value.is_finite() && *value >= 0.0)
+                .map(|value| value.min(60_000.0));
             sqlx::query(
                 r#"
                 INSERT INTO ping_samples(server_id, ping_target_id, target_name, host, mode, checked_at, success, latency_ms, error)
@@ -1537,14 +1785,14 @@ async fn agent_metrics(
                 "#,
             )
             .bind(server_id)
-            .bind(ping.target_id)
-            .bind(ping.target_name)
-            .bind(ping.host)
-            .bind(ping.mode)
-            .bind(ping.checked_at.unwrap_or(now))
+            .bind(target_id)
+            .bind(target_name)
+            .bind(host)
+            .bind(mode)
+            .bind(bounded_agent_timestamp(ping.checked_at, now))
             .bind(ping.success)
-            .bind(ping.latency_ms)
-            .bind(ping.error)
+            .bind(latency)
+            .bind(ping.error.map(|value| truncate_text(&value, 500)))
             .execute(&state.pool)
             .await?;
         }
@@ -1577,13 +1825,12 @@ fn open_geoip(path: &FsPath) -> anyhow::Result<Option<GeoIp>> {
 }
 
 async fn update_geoip_database(state: &AppState, settings: &GeoIpSettings) -> Result<String, AppError> {
-    validate_geoip_download_url(&settings.download_url)?;
-    let response = state
-        .http
-        .get(&settings.download_url)
+    let (download_client, download_url) = secure_geoip_download_client(&settings.download_url).await?;
+    let mut response = download_client
+        .get(download_url)
         .send()
         .await
-        .map_err(|err| AppError::internal(format!("GeoIP 数据库下载失败：{}", err)))?;
+        .map_err(|_| AppError::internal("GeoIP 数据库下载失败"))?;
     let status = response.status();
     if !status.is_success() {
         return Err(AppError::internal(format!("GeoIP 数据库下载失败：HTTP {}", status)));
@@ -1593,14 +1840,20 @@ async fn update_geoip_database(state: &AppState, settings: &GeoIpSettings) -> Re
             return Err(AppError::bad_request("GeoIP 数据库下载文件过大，已拒绝"));
         }
     }
-    let downloaded = response
-        .bytes()
+    let mut downloaded = Vec::with_capacity(
+        response.content_length().unwrap_or(0).min(1024 * 1024) as usize,
+    );
+    while let Some(chunk) = response
+        .chunk()
         .await
-        .map_err(|err| AppError::internal(format!("GeoIP 数据库读取失败：{}", err)))?;
-    if downloaded.len() > MAX_GEOIP_DOWNLOAD_BYTES {
-        return Err(AppError::bad_request("GeoIP 数据库下载文件过大，已拒绝"));
+        .map_err(|_| AppError::internal("GeoIP 数据库读取失败"))?
+    {
+        if downloaded.len().saturating_add(chunk.len()) > MAX_GEOIP_DOWNLOAD_BYTES {
+            return Err(AppError::bad_request("GeoIP 数据库下载文件过大，已拒绝"));
+        }
+        downloaded.extend_from_slice(&chunk);
     }
-    let database = decode_geoip_database(&settings.download_url, downloaded.as_ref())?;
+    let database = decode_geoip_database(&settings.download_url, &downloaded)?;
     if database.is_empty() || database.len() > MAX_GEOIP_DATABASE_BYTES {
         return Err(AppError::bad_request("GeoIP 数据库解压后大小异常，已拒绝"));
     }
@@ -1844,11 +2097,39 @@ fn validate_geoip_provider(provider: &str) -> Result<(), AppError> {
 }
 
 fn validate_geoip_download_url(url: &str) -> Result<(), AppError> {
-    if url.starts_with("https://") || url.starts_with("http://") {
-        Ok(())
-    } else {
-        Err(AppError::bad_request("GeoIP 数据库下载 URL 必须以 http:// 或 https:// 开头"))
+    let parsed = reqwest::Url::parse(url)
+        .map_err(|_| AppError::bad_request("GeoIP 数据库下载 URL 格式不正确"))?;
+    if parsed.scheme() != "https" {
+        return Err(AppError::bad_request("GeoIP 数据库下载 URL 必须使用 HTTPS"));
     }
+    if parsed.username() != "" || parsed.password().is_some() || parsed.host_str().is_none() {
+        return Err(AppError::bad_request("GeoIP 数据库下载 URL 不允许包含认证信息，且必须包含主机名"));
+    }
+    Ok(())
+}
+
+async fn secure_geoip_download_client(url: &str) -> Result<(reqwest::Client, reqwest::Url), AppError> {
+    validate_geoip_download_url(url)?;
+    let parsed = reqwest::Url::parse(url)
+        .map_err(|_| AppError::bad_request("GeoIP 数据库下载 URL 格式不正确"))?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| AppError::bad_request("GeoIP 数据库下载 URL 缺少主机名"))?;
+    let port = parsed.port_or_known_default().unwrap_or(443);
+    let addresses = lookup_host((host, port))
+        .await
+        .map_err(|_| AppError::bad_request("GeoIP 数据库下载主机无法解析"))?
+        .collect::<Vec<_>>();
+    if addresses.is_empty() || addresses.iter().any(|addr| !is_geoip_candidate(addr.ip())) {
+        return Err(AppError::bad_request("GeoIP 数据库下载地址解析到了非公网 IP，已拒绝"));
+    }
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
+        .resolve(host, addresses[0])
+        .build()
+        .map_err(|_| AppError::internal("无法创建 GeoIP 下载客户端"))?;
+    Ok((client, parsed))
 }
 
 fn geoip_location_value(location: GeoIpLocation) -> Value {
@@ -2064,17 +2345,27 @@ async fn upsert_geoip_status(pool: &PgPool, message: &str) -> Result<(), AppErro
 fn is_geoip_candidate(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(ip) => {
+            let octets = ip.octets();
             !(ip.is_private()
                 || ip.is_loopback()
                 || ip.is_link_local()
                 || ip.is_unspecified()
-                || ip.is_broadcast())
+                || ip.is_broadcast()
+                || ip.is_multicast()
+                || ip.is_documentation()
+                || octets[0] == 0
+                || (octets[0] == 100 && (64..=127).contains(&octets[1]))
+                || (octets[0] == 198 && (octets[1] == 18 || octets[1] == 19)))
         }
         IpAddr::V6(ip) => {
+            let segments = ip.segments();
             !(ip.is_loopback()
                 || ip.is_unspecified()
                 || ip.is_unique_local()
-                || ip.is_unicast_link_local())
+                || ip.is_unicast_link_local()
+                || ip.is_multicast()
+                || (segments[0] == 0x2001 && segments[1] == 0x0db8)
+                || ip.to_ipv4_mapped().is_some_and(|mapped| !is_geoip_candidate(IpAddr::V4(mapped))))
         }
     }
 }
@@ -2343,10 +2634,10 @@ async fn notify_alert(state: &AppState, alert_id: Uuid, text: &str) -> anyhow::R
                 .execute(&state.pool)
                 .await?;
         }
-        Err(err) => {
+        Err(_) => {
             sqlx::query("UPDATE alerts SET notify_error=$2 WHERE id=$1")
                 .bind(alert_id)
-                .bind(err.to_string())
+                .bind("Telegram 请求发送失败")
                 .execute(&state.pool)
                 .await?;
         }
@@ -2593,6 +2884,25 @@ async fn authenticate_agent(pool: &PgPool, headers: &HeaderMap) -> Result<sqlx::
     server.ok_or_else(|| AppError::unauthorized("Agent token 无效"))
 }
 
+async fn authenticate_agent_request(
+    state: &AppState,
+    headers: &HeaderMap,
+    peer: SocketAddr,
+) -> Result<sqlx::postgres::PgRow, AppError> {
+    let rate_key = auth_rate_key("agent", headers, peer, state.config.trust_proxy_headers);
+    state.auth_limiter.check(&rate_key).await?;
+    match authenticate_agent(&state.pool, headers).await {
+        Ok(server) => {
+            state.auth_limiter.clear(&rate_key).await;
+            Ok(server)
+        }
+        Err(error) => {
+            state.auth_limiter.record_failure(&rate_key).await;
+            Err(error)
+        }
+    }
+}
+
 fn server_row_to_json(r: &sqlx::postgres::PgRow, config: &Config) -> Value {
     let mut v = public_server_row_to_json(r);
     if let Value::Object(ref mut obj) = v {
@@ -2723,16 +3033,78 @@ fn mask_ip(ip: &str) -> String {
     "***".to_string()
 }
 
-fn forwarded_ip(headers: &HeaderMap) -> Option<String> {
-    for name in ["cf-connecting-ip", "x-real-ip", "x-forwarded-for"] {
-        if let Some(value) = headers.get(name).and_then(|v| v.to_str().ok()) {
-            let first = value.split(',').next().unwrap_or(value).trim();
-            if !first.is_empty() {
-                return Some(first.to_string());
-            }
+fn forwarded_ip_addr(headers: &HeaderMap) -> Option<IpAddr> {
+    if let Some(value) = headers.get("x-real-ip").and_then(|value| value.to_str().ok()) {
+        if let Ok(ip) = value.trim().parse::<IpAddr>() {
+            return Some(ip);
+        }
+    }
+    if let Some(value) = headers.get("x-forwarded-for").and_then(|value| value.to_str().ok()) {
+        let nearest = value.split(',').next_back().unwrap_or(value).trim();
+        if let Ok(ip) = nearest.parse::<IpAddr>() {
+            return Some(ip);
         }
     }
     None
+}
+
+fn request_ip(headers: &HeaderMap, peer: SocketAddr, trust_proxy_headers: bool) -> IpAddr {
+    if trust_proxy_headers {
+        forwarded_ip_addr(headers).unwrap_or_else(|| peer.ip())
+    } else {
+        peer.ip()
+    }
+}
+
+fn request_public_ip(headers: &HeaderMap, peer: SocketAddr, trust_proxy_headers: bool) -> Option<String> {
+    let ip = request_ip(headers, peer, trust_proxy_headers);
+    is_geoip_candidate(ip).then(|| ip.to_string())
+}
+
+fn auth_rate_key(action: &str, headers: &HeaderMap, peer: SocketAddr, trust_proxy_headers: bool) -> String {
+    format!("{}:{}", action, request_ip(headers, peer, trust_proxy_headers))
+}
+
+fn valid_public_ip(value: &str) -> Option<String> {
+    let ip = value.trim().parse::<IpAddr>().ok()?;
+    is_geoip_candidate(ip).then(|| ip.to_string())
+}
+
+fn bounded_agent_timestamp(value: Option<DateTime<Utc>>, now: DateTime<Utc>) -> DateTime<Utc> {
+    match value {
+        Some(value)
+            if value >= now - ChronoDuration::minutes(15)
+                && value <= now + ChronoDuration::minutes(2) => value,
+        _ => now,
+    }
+}
+
+fn truncate_text(value: &str, max_chars: usize) -> String {
+    value
+        .trim()
+        .chars()
+        .filter(|value| !value.is_control())
+        .take(max_chars)
+        .collect()
+}
+
+fn clean_optional_text(value: Option<String>, max_chars: usize) -> Option<String> {
+    value
+        .map(|value| truncate_text(&value, max_chars))
+        .filter(|value| !value.is_empty())
+}
+
+fn sanitize_system_info(info: Option<SystemInfoPayload>) -> Option<SystemInfoPayload> {
+    info.map(|info| SystemInfoPayload {
+        hostname: clean_optional_text(info.hostname, 255),
+        os_name: clean_optional_text(info.os_name, 255),
+        kernel_version: clean_optional_text(info.kernel_version, 255),
+        arch: clean_optional_text(info.arch, 64),
+    })
+}
+
+fn finite_nonnegative(value: f64) -> f64 {
+    if value.is_finite() { value.max(0.0).min(1_000_000.0) } else { 0.0 }
 }
 
 #[derive(Serialize)]
@@ -2905,11 +3277,160 @@ fn shell_quote(value: &str) -> String {
 }
 
 fn validate_username_password(username: &str, password: &str) -> Result<(), AppError> {
-    if username.trim().len() < 3 {
+    let username_len = username.trim().chars().count();
+    if username_len < 3 {
         return Err(AppError::bad_request("用户名至少 3 个字符"));
     }
-    if password.len() < 12 {
+    if username_len > 64 {
+        return Err(AppError::bad_request("用户名不能超过 64 个字符"));
+    }
+    if password.chars().count() < 12 {
         return Err(AppError::bad_request("密码至少 12 个字符"));
+    }
+    if password.chars().count() > 1024 {
+        return Err(AppError::bad_request("密码不能超过 1024 个字符"));
+    }
+    Ok(())
+}
+
+fn validate_login_input(username: &str, password: &str) -> Result<(), AppError> {
+    if username.trim().is_empty() || username.trim().chars().count() > 64 || password.chars().count() > 1024 {
+        return Err(AppError::bad_request("登录输入长度不合法"));
+    }
+    Ok(())
+}
+
+fn validate_required_text(field: &str, value: &str, max_chars: usize) -> Result<String, AppError> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(AppError::bad_request(format!("{}不能为空", field)));
+    }
+    if value.chars().count() > max_chars || value.chars().any(char::is_control) {
+        return Err(AppError::bad_request(format!("{}格式不合法或超过 {} 个字符", field, max_chars)));
+    }
+    Ok(value.to_string())
+}
+
+fn validate_optional_text(field: &str, value: Option<&str>, max_chars: usize) -> Result<String, AppError> {
+    let value = value.unwrap_or("").trim();
+    if value.chars().count() > max_chars || value.chars().any(|ch| ch.is_control() && ch != '\n' && ch != '\t') {
+        return Err(AppError::bad_request(format!("{}格式不合法或超过 {} 个字符", field, max_chars)));
+    }
+    Ok(value.to_string())
+}
+
+fn validate_coordinates(latitude: Option<f64>, longitude: Option<f64>) -> Result<(), AppError> {
+    if latitude.is_some() != longitude.is_some() {
+        return Err(AppError::bad_request("纬度和经度必须同时填写或同时留空"));
+    }
+    if latitude.is_some_and(|value| !value.is_finite() || !(-90.0..=90.0).contains(&value)) {
+        return Err(AppError::bad_request("纬度必须在 -90 到 90 之间"));
+    }
+    if longitude.is_some_and(|value| !value.is_finite() || !(-180.0..=180.0).contains(&value)) {
+        return Err(AppError::bad_request("经度必须在 -180 到 180 之间"));
+    }
+    Ok(())
+}
+
+fn validate_telegram_settings(value: &Value) -> Result<Value, AppError> {
+    let enabled = value.get("enabled").and_then(Value::as_bool).unwrap_or(false);
+    let bot_token = validate_optional_text("Telegram Bot Token", value.get("bot_token").and_then(Value::as_str), 256)?;
+    let chat_id = validate_optional_text("Telegram Chat ID", value.get("chat_id").and_then(Value::as_str), 128)?;
+    let message_template = validate_optional_text(
+        "Telegram 消息模板",
+        value.get("message_template").and_then(Value::as_str),
+        4096,
+    )?;
+    if enabled && (bot_token.is_empty() || chat_id.is_empty()) {
+        return Err(AppError::bad_request("启用 Telegram 通知时必须填写 Bot Token 和 Chat ID"));
+    }
+    if !bot_token.is_empty()
+        && !bot_token
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, ':' | '_' | '-'))
+    {
+        return Err(AppError::bad_request("Telegram Bot Token 格式不合法"));
+    }
+    Ok(json!({
+        "enabled": enabled,
+        "bot_token": bot_token,
+        "chat_id": chat_id,
+        "message_template": message_template
+    }))
+}
+
+fn validate_public_settings(value: &Value) -> Result<(), AppError> {
+    let object = value.as_object().ok_or_else(|| AppError::bad_request("公开展示设置格式不正确"))?;
+    validate_optional_text("站点名称", object.get("brand_name").and_then(Value::as_str), 100)?;
+    validate_optional_text("中心节点名称", object.get("center_name").and_then(Value::as_str), 100)?;
+    for key in ["center_auto_country", "center_auto_region", "center_auto_city", "center_auto_status"] {
+        validate_optional_text(key, object.get(key).and_then(Value::as_str), 255)?;
+    }
+    if let Some(mode) = object.get("center_location_mode").and_then(Value::as_str) {
+        if !matches!(mode, "auto" | "manual") {
+            return Err(AppError::bad_request("center_location_mode 不合法"));
+        }
+    }
+    for (key, allowed) in [
+        ("default_language", &["zh", "en"][..]),
+        ("default_map_mode", &["2d", "3d"][..]),
+        ("default_server_view", &["table", "cards"][..]),
+    ] {
+        if let Some(value) = object.get(key).and_then(Value::as_str) {
+            if !allowed.contains(&value) {
+                return Err(AppError::bad_request(format!("{} 不合法", key)));
+            }
+        }
+    }
+    validate_coordinates(
+        object.get("center_latitude").and_then(Value::as_f64),
+        object.get("center_longitude").and_then(Value::as_f64),
+    )?;
+    if let Some(background) = object.get("background").and_then(Value::as_object) {
+        let image_url = background.get("image_url").and_then(Value::as_str).unwrap_or("");
+        if !image_url.is_empty() && !is_background_image_url(image_url) {
+            return Err(AppError::bad_request("背景图片地址必须来自本站上传目录"));
+        }
+        if let Some(fit) = background.get("fit").and_then(Value::as_str) {
+            if !matches!(fit, "cover" | "contain") {
+                return Err(AppError::bad_request("背景适配方式不合法"));
+            }
+        }
+        if let Some(position) = background.get("position").and_then(Value::as_str) {
+            if !matches!(position, "center" | "top" | "bottom" | "left" | "right") {
+                return Err(AppError::bad_request("背景位置不合法"));
+            }
+        }
+        for (key, min, max) in [("blur", 0.0, 40.0), ("brightness", 20.0, 160.0), ("overlay", 0.0, 100.0)] {
+            if let Some(number) = background.get(key).and_then(Value::as_f64) {
+                if !number.is_finite() || !(min..=max).contains(&number) {
+                    return Err(AppError::bad_request(format!("背景参数 {} 超出允许范围", key)));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn is_background_image_url(value: &str) -> bool {
+    let Some(name) = value.strip_prefix("/uploads/background-") else { return false };
+    !name.contains('/')
+        && name.len() <= 80
+        && [".jpg", ".png", ".webp"].iter().any(|suffix| name.ends_with(suffix))
+}
+
+fn validate_alert_rule(rule: &AlertRuleInput) -> Result<(), AppError> {
+    if !matches!(rule.key.as_str(), "offline" | "cpu_high" | "memory_high" | "disk_high" | "traffic_high") {
+        return Err(AppError::bad_request("未知告警规则"));
+    }
+    if !rule.threshold.is_finite() || !(0.0..=1_000_000.0).contains(&rule.threshold) {
+        return Err(AppError::bad_request("告警阈值不合法"));
+    }
+    if !(0..=86_400).contains(&rule.duration_seconds) {
+        return Err(AppError::bad_request("告警持续时间必须在 0-86400 秒之间"));
+    }
+    if !(60..=2_592_000).contains(&rule.repeat_seconds) {
+        return Err(AppError::bad_request("告警重复通知间隔必须在 60-2592000 秒之间"));
     }
     Ok(())
 }
@@ -2924,14 +3445,27 @@ fn validate_ping_target(req: &CreatePingTargetRequest) -> Result<(), AppError> {
     if req.scope == "server" && req.server_id.is_none() {
         return Err(AppError::bad_request("单机目标必须绑定 server_id"));
     }
-    if req.name.trim().is_empty() || req.host.trim().is_empty() {
-        return Err(AppError::bad_request("Ping 目标名称和 host 不能为空"));
+    validate_required_text("Ping 目标名称", &req.name, 100)?;
+    let host = validate_required_text("Ping host", &req.host, 253)?;
+    if host.starts_with('-')
+        || !host.chars().all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_' | ':'))
+    {
+        return Err(AppError::bad_request("Ping host 格式不合法，请填写 IP 或域名"));
     }
     if req.mode != "icmp" && req.mode != "tcp" {
         return Err(AppError::bad_request("mode 只能是 icmp 或 tcp"));
     }
     if req.mode == "tcp" && req.tcp_port.is_none() {
         return Err(AppError::bad_request("TCP Ping 必须设置 tcp_port"));
+    }
+    if req.tcp_port.is_some_and(|port| !(1..=65535).contains(&port)) {
+        return Err(AppError::bad_request("tcp_port 必须在 1-65535 之间"));
+    }
+    if req.interval_seconds.is_some_and(|value| !(5..=3600).contains(&value)) {
+        return Err(AppError::bad_request("interval_seconds 必须在 5-3600 之间"));
+    }
+    if req.timeout_ms.is_some_and(|value| !(100..=10000).contains(&value)) {
+        return Err(AppError::bad_request("timeout_ms 必须在 100-10000 之间"));
     }
     Ok(())
 }
@@ -2972,11 +3506,9 @@ fn hash_password(password: &str) -> Result<String, AppError> {
         .map_err(|_| AppError::internal("密码哈希失败"))
 }
 
-fn verify_password(password: &str, password_hash: &str) -> Result<(), AppError> {
-    let parsed = PasswordHash::new(password_hash).map_err(|_| AppError::internal("密码哈希格式错误"))?;
-    Argon2::default()
-        .verify_password(password.as_bytes(), &parsed)
-        .map_err(|_| AppError::unauthorized("用户名或密码错误"))
+fn verify_password_matches(password: &str, password_hash: &str) -> bool {
+    let Ok(parsed) = PasswordHash::new(password_hash) else { return false };
+    Argon2::default().verify_password(password.as_bytes(), &parsed).is_ok()
 }
 
 fn random_token() -> String {
@@ -3028,6 +3560,10 @@ impl AppError {
 
     fn unauthorized(message: impl Into<String>) -> Self {
         Self { status: StatusCode::UNAUTHORIZED, message: message.into() }
+    }
+
+    fn too_many_requests(message: impl Into<String>) -> Self {
+        Self { status: StatusCode::TOO_MANY_REQUESTS, message: message.into() }
     }
 
     fn not_found(message: impl Into<String>) -> Self {

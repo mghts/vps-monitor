@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Docker image tag, for example v0.1.0"
+        description: "Docker image tag, for example v0.2.0"
         required: true
-        default: "v0.1.0"
+        default: "v0.2.0"
       push_latest:
         description: "Also push the latest tag"
         required: true
@@ -32,8 +32,14 @@ jobs:
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
         run: |
-          test -n "$DOCKERHUB_USERNAME" || (echo "Missing DOCKERHUB_USERNAME secret" && exit 1)
-          test -n "$DOCKERHUB_TOKEN" || (echo "Missing DOCKERHUB_TOKEN secret" && exit 1)
+          if [ -z "$DOCKERHUB_USERNAME" ]; then
+            echo "::error title=缺少 Docker Hub 用户名::请在仓库 Settings -> Secrets and variables -> Actions -> Repository secrets 中添加名为 DOCKERHUB_USERNAME 的 Secret，值为 Docker Hub 用户名（不是 GitHub 用户名）。"
+            exit 1
+          fi
+          if [ -z "$DOCKERHUB_TOKEN" ]; then
+            echo "::error title=缺少 Docker Hub Token::请在同一位置添加名为 DOCKERHUB_TOKEN 的 Secret，值为 Docker Hub Personal Access Token，且至少具有 Read & Write 权限。"
+            exit 1
+          fi
 
       - name: Prepare image tags
         id: meta

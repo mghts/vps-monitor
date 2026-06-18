@@ -31,6 +31,56 @@ const navigation = [
   { id: 'map', label: '节点地图', icon: GlobeHemisphereWest }
 ] as const;
 
+type AppRoute = {
+  section: PublicSection;
+  selectedServerId: string | null;
+  adminOpen: boolean;
+};
+
+type HistoryMode = 'push' | 'replace';
+
+const publicSections = new Set<PublicSection>(['overview', 'servers', 'ping', 'map']);
+
+function isPublicSection(value: string | null): value is PublicSection {
+  return Boolean(value && publicSections.has(value as PublicSection));
+}
+
+function hasRouteState() {
+  const params = new URLSearchParams(window.location.search);
+  return params.has('view') || params.has('server') || params.has('admin');
+}
+
+function routeFromLocation(): AppRoute {
+  const params = new URLSearchParams(window.location.search);
+  const rawView = params.get('view');
+  const section = rawView === 'list'
+    ? 'servers'
+    : isPublicSection(rawView)
+      ? rawView
+      : 'overview';
+  const adminOpen = params.get('admin') === '1';
+  const selectedServerId = adminOpen ? null : params.get('server');
+  return {
+    section,
+    selectedServerId: selectedServerId || null,
+    adminOpen
+  };
+}
+
+function routeUrl(route: AppRoute) {
+  const url = new URL(window.location.href);
+  url.searchParams.delete('view');
+  url.searchParams.delete('server');
+  url.searchParams.delete('admin');
+  if (route.adminOpen) {
+    url.searchParams.set('admin', '1');
+  } else {
+    url.searchParams.set('view', route.section);
+    if (route.selectedServerId) url.searchParams.set('server', route.selectedServerId);
+  }
+  return `${url.pathname}${url.search}${url.hash}`;
+}
+
 function sampleFromSummary(summary: PublicSummary, time = new Date(), phase = 0): FleetSample {
   const online = summary.servers.filter((server) => server.online);
   const cpu = average(online.map((server) => server.metrics.cpu_usage));
@@ -65,10 +115,11 @@ function refreshSecondsFromSummary(summary: PublicSummary | null) {
 
 export default function App() {
   const demo = new URLSearchParams(window.location.search).get('demo') === '1';
+  const initialRoute = routeFromLocation();
   const [summary, setSummary] = useState<PublicSummary | null>(demo ? demoSummary : null);
-  const [section, setSection] = useState<PublicSection>('overview');
-  const [selectedServerId, setSelectedServerId] = useState<string | null>(null);
-  const [adminOpen, setAdminOpen] = useState(false);
+  const [section, setSection] = useState<PublicSection>(initialRoute.section);
+  const [selectedServerId, setSelectedServerId] = useState<string | null>(initialRoute.selectedServerId);
+  const [adminOpen, setAdminOpen] = useState(initialRoute.adminOpen);
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const [search, setSearch] = useState('');
   const [error, setError] = useState('');
@@ -80,12 +131,32 @@ export default function App() {
   const [language, setLanguage] = useState<Language>(() =>
     window.localStorage.getItem('vps-monitor-language') === 'en' ? 'en' : 'zh'
   );
-  const defaultViewApplied = useRef(demo);
+  const defaultViewApplied = useRef(demo || hasRouteState());
   const defaultLanguageApplied = useRef(Boolean(window.localStorage.getItem('vps-monitor-language')));
   const background = summary?.settings.background;
   const showBackground = Boolean(background?.enabled && background.image_url);
   const brandName = summary?.settings.brand_name?.trim() || 'Notebook Atlas';
   const refreshIntervalSeconds = refreshSecondsFromSummary(summary);
+
+  function commitRoute(route: AppRoute) {
+    setAdminOpen(route.adminOpen);
+    setSelectedServerId(route.adminOpen ? null : route.selectedServerId);
+    setSection(route.section);
+    setMobileNavOpen(false);
+  }
+
+  function writeRoute(route: AppRoute, mode: HistoryMode) {
+    const nextUrl = routeUrl(route);
+    const currentUrl = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+    if (nextUrl === currentUrl) return;
+    window.history[mode === 'replace' ? 'replaceState' : 'pushState']({ vpsMonitorRoute: route }, '', nextUrl);
+  }
+
+  function openRoute(route: AppRoute, mode: HistoryMode = 'push') {
+    defaultViewApplied.current = true;
+    commitRoute(route);
+    writeRoute(route, mode);
+  }
 
   async function loadSummary() {
     if (demo) {
@@ -102,7 +173,8 @@ export default function App() {
         defaultLanguageApplied.current = true;
       }
       if (!defaultViewApplied.current) {
-        setSection(next.settings.default_view === 'map' ? 'map' : next.settings.default_view === 'list' ? 'servers' : 'overview');
+        const defaultSection = next.settings.default_view === 'map' ? 'map' : next.settings.default_view === 'list' ? 'servers' : 'overview';
+        openRoute({ section: defaultSection, selectedServerId: null, adminOpen: false }, 'replace');
         defaultViewApplied.current = true;
       }
       setHistory((current) => [...current, sampleFromSummary(next)].slice(-48));
@@ -120,6 +192,15 @@ export default function App() {
   }, [demo, refreshIntervalSeconds]);
 
   useEffect(() => {
+    const syncFromHistory = () => {
+      defaultViewApplied.current = true;
+      commitRoute(routeFromLocation());
+    };
+    window.addEventListener('popstate', syncFromHistory);
+    return () => window.removeEventListener('popstate', syncFromHistory);
+  }, []);
+
+  useEffect(() => {
     document.documentElement.dataset.theme = theme;
     window.localStorage.setItem('vps-monitor-theme', theme);
   }, [theme]);
@@ -131,9 +212,8 @@ export default function App() {
   const t = (source: string, variables?: Record<string, string | number>) => translate(language, source, variables);
   const pageTitle = useMemo(() => {
     if (adminOpen) return t('配置本');
-    if (selectedServerId) {
-      return summary?.servers.find((server) => server.id === selectedServerId)?.name || t('节点详情');
-    }
+    const selectedServer = selectedServerId ? summary?.servers.find((server) => server.id === selectedServerId) : null;
+    if (selectedServer) return selectedServer.name;
     return {
       overview: t('观测台'),
       servers: t('节点簿'),
@@ -143,10 +223,7 @@ export default function App() {
   }, [adminOpen, language, section, selectedServerId, summary]);
 
   function navigate(next: PublicSection) {
-    setAdminOpen(false);
-    setSelectedServerId(null);
-    setSection(next);
-    setMobileNavOpen(false);
+    openRoute({ section: next, selectedServerId: null, adminOpen: false });
   }
 
   return (
@@ -170,7 +247,7 @@ export default function App() {
             );
           })}
           <span className="nav-label">{t('工具')}</span>
-          <button className={adminOpen ? 'active' : ''} onClick={() => { setSelectedServerId(null); setAdminOpen(true); setMobileNavOpen(false); }}>
+          <button className={adminOpen ? 'active' : ''} onClick={() => openRoute({ section, selectedServerId: null, adminOpen: true })}>
             <Gear size={19} />
             <span>{t('配置本')}</span>
           </button>
@@ -193,7 +270,6 @@ export default function App() {
             <div><span>{t('系统状态')}</span><b>{error ? t('连接异常') : t('运行正常')}</b></div>
             <i className={error ? 'bad' : ''} />
           </div>
-          <div className="sidebar-version">v0.1.0</div>
         </div>
       </aside>
 
@@ -249,10 +325,13 @@ export default function App() {
             <button className="icon-button header-icon" onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')} title={t('切换主题')}>
               {theme === 'dark' ? <Sun size={19} /> : <Moon size={19} />}
             </button>
-            <button className="icon-button header-icon alert-button" onClick={() => { setSelectedServerId(null); setAdminOpen(true); }} title={t('查看告警')}>
+            <button className="icon-button header-icon alert-button" onClick={() => openRoute({ section, selectedServerId: null, adminOpen: true })} title={t('查看告警')}>
               <Bell size={19} />
             </button>
-            <button className={`profile-button ${adminOpen ? 'active' : ''}`} onClick={() => { setSelectedServerId(null); setAdminOpen((value) => !value); }}>
+            <button
+              className={`profile-button ${adminOpen ? 'active' : ''}`}
+              onClick={() => openRoute({ section, selectedServerId: null, adminOpen: !adminOpen }, adminOpen ? 'replace' : 'push')}
+            >
               <span>A</span>
               <b>Admin</b>
             </button>
@@ -262,14 +341,14 @@ export default function App() {
         <div className="content-viewport">
           {error && <div className="global-error">{error}</div>}
           {adminOpen ? (
-            <AdminPanel demo={demo} onChanged={loadSummary} onExit={() => setAdminOpen(false)} />
+            <AdminPanel demo={demo} onChanged={loadSummary} onExit={() => openRoute({ section, selectedServerId: null, adminOpen: false }, 'replace')} />
           ) : summary ? (
             <Dashboard
               summary={summary}
               section={section}
               selectedServerId={selectedServerId}
-              onSelectServer={setSelectedServerId}
-              onCloseServer={() => setSelectedServerId(null)}
+              onSelectServer={(serverId) => openRoute({ section, selectedServerId: serverId, adminOpen: false })}
+              onCloseServer={() => openRoute({ section, selectedServerId: null, adminOpen: false }, 'replace')}
               history={history}
               search={search}
               demo={demo}

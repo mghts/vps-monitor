@@ -3,15 +3,26 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { useI18n } from './i18n';
 
+export type GlobeNodeMember = {
+  id: string;
+  name: string;
+  online: boolean;
+  city?: string;
+  country?: string;
+  ipMasked?: string;
+};
+
 export type GlobeNode = {
   id: string;
   name: string;
   online: boolean;
+  status?: 'online' | 'offline' | 'mixed';
   latitude: number;
   longitude: number;
   city?: string;
   country?: string;
   ipMasked?: string;
+  members?: GlobeNodeMember[];
 };
 
 type Props = {
@@ -41,6 +52,18 @@ function latLngToVector(latitude: number, longitude: number, radius: number) {
 
 function indexFromId(id: string) {
   return [...id].reduce((sum, character) => sum + character.charCodeAt(0), 0);
+}
+
+function globeStatusColor(status: GlobeNode['status'], online: boolean, theme: 'dark' | 'light') {
+  if (status === 'offline' || !online) return theme === 'light' ? 0xd97974 : 0xe58b83;
+  if (status === 'mixed') return theme === 'light' ? 0xd79a4d : 0xe0ba72;
+  return theme === 'light' ? 0x74ad82 : 0x9ec989;
+}
+
+function globeLineColor(status: GlobeNode['status'], online: boolean, theme: 'dark' | 'light') {
+  if (status === 'offline' || !online) return theme === 'light' ? 0xd97974 : 0xe58b83;
+  if (status === 'mixed') return theme === 'light' ? 0xd79a4d : 0xe0ba72;
+  return theme === 'light' ? 0x6aa8a5 : 0x8ddad2;
 }
 
 function createArc(start: THREE.Vector3, end: THREE.Vector3, color: number) {
@@ -158,14 +181,16 @@ const GlobeMap = forwardRef<GlobeMapHandle, Props>(function GlobeMap({ nodes, ce
   const { t } = useI18n();
   const mountRef = useRef<HTMLDivElement>(null);
   const resetRef = useRef<() => void>(() => undefined);
+  const pinnedRef = useRef(false);
   const markerMaterialsRef = useRef(new Map<string, THREE.MeshBasicMaterial>());
   const [selected, setSelected] = useState<GlobeNode | null>(null);
+  const [selectionPinned, setSelectionPinned] = useState(false);
   const [failed, setFailed] = useState(false);
   const geometryKey = useMemo(
     () => [
       center ? `${center.latitude}:${center.longitude}` : 'no-center',
       theme,
-      ...nodes.map((node) => `${node.id}:${node.online}:${node.latitude}:${node.longitude}`)
+      ...nodes.map((node) => `${node.id}:${node.online}:${node.status || ''}:${node.latitude}:${node.longitude}:${node.members?.length || 1}`)
     ].join('|'),
     [center?.latitude, center?.longitude, nodes, theme]
   );
@@ -286,13 +311,13 @@ const GlobeMap = forwardRef<GlobeMapHandle, Props>(function GlobeMap({ nodes, ce
 
     nodes.forEach((node) => {
       const position = latLngToVector(node.latitude, node.longitude, 1.025);
+      const status = node.status || (node.online ? 'online' : 'offline');
+      const memberCount = node.members?.length || 1;
       const markerMaterial = new THREE.MeshBasicMaterial({
-          color: node.online
-          ? (theme === 'light' ? 0x74ad82 : 0x9ec989)
-          : (theme === 'light' ? 0xd97974 : 0xe58b83)
+        color: globeStatusColor(status, node.online, theme)
       });
       const marker = new THREE.Mesh(
-        new THREE.SphereGeometry(node.online ? 0.022 : 0.028, 16, 16),
+        new THREE.SphereGeometry(Math.min(0.036, (status === 'offline' ? 0.028 : 0.022) + Math.max(0, memberCount - 1) * 0.0035), 18, 18),
         markerMaterial
       ) as THREE.Mesh & { userData: { node?: GlobeNode } };
       marker.position.copy(position);
@@ -302,12 +327,10 @@ const GlobeMap = forwardRef<GlobeMapHandle, Props>(function GlobeMap({ nodes, ce
       globeGroup.add(marker);
 
       if (centerPosition && node.id !== 'center' && centerPosition.angleTo(position) > 0.01) {
-        const color = node.online
-          ? (theme === 'light' ? 0x6aa8a5 : 0x8ddad2)
-          : (theme === 'light' ? 0xd97974 : 0xe58b83);
+        const color = globeLineColor(status, node.online, theme);
         const arc = createArc(centerPosition, position, color);
         globeGroup.add(arc.group);
-        if (node.online) {
+        if (status !== 'offline') {
           [0, 0.42].forEach((offset, particleIndex) => {
             const particle = new THREE.Mesh(
               new THREE.SphereGeometry(particleIndex === 0 ? 0.011 : 0.007, 12, 12),
@@ -369,6 +392,7 @@ const GlobeMap = forwardRef<GlobeMapHandle, Props>(function GlobeMap({ nodes, ce
     };
     let hoveredNodeId = '';
     const handlePointerMove = (event: PointerEvent) => {
+      if (pinnedRef.current) return;
       const node = pointedNode(event);
       renderer.domElement.style.cursor = node ? 'pointer' : 'grab';
       const nextNodeId = node?.id || '';
@@ -378,13 +402,27 @@ const GlobeMap = forwardRef<GlobeMapHandle, Props>(function GlobeMap({ nodes, ce
       }
     };
     const handlePointerLeave = () => {
+      if (pinnedRef.current) return;
       renderer.domElement.style.cursor = 'grab';
       hoveredNodeId = '';
       setSelected(null);
     };
     const handlePointer = (event: PointerEvent) => {
       const node = pointedNode(event);
-      if (node) onSelectNode?.(node.id);
+      if (!node) {
+        pinnedRef.current = false;
+        setSelectionPinned(false);
+        setSelected(null);
+        return;
+      }
+      const members = node.members || [];
+      if (members.length > 1) {
+        pinnedRef.current = true;
+        setSelectionPinned(true);
+        setSelected(node);
+      } else {
+        onSelectNode?.(members[0]?.id || node.id);
+      }
     };
     renderer.domElement.style.cursor = 'grab';
     renderer.domElement.addEventListener('pointermove', handlePointerMove);
@@ -446,15 +484,24 @@ const GlobeMap = forwardRef<GlobeMapHandle, Props>(function GlobeMap({ nodes, ce
   useEffect(() => {
     nodes.forEach((node) => {
       markerMaterialsRef.current.get(node.id)?.color.setHex(
-        node.online
-          ? (theme === 'light' ? 0x74ad82 : 0x9ec989)
-          : (theme === 'light' ? 0xd97974 : 0xe58b83)
+        globeStatusColor(node.status || (node.online ? 'online' : 'offline'), node.online, theme)
       );
     });
-    setSelected((current) => current
-      ? nodes.find((node) => node.id === current.id) || null
-      : null);
+    setSelected((current) => {
+      const next = current ? nodes.find((node) => node.id === current.id) || null : null;
+      if (!next) {
+        pinnedRef.current = false;
+        setSelectionPinned(false);
+      }
+      return next;
+    });
   }, [nodes, theme]);
+
+  function closeSelection() {
+    pinnedRef.current = false;
+    setSelectionPinned(false);
+    setSelected(null);
+  }
 
   return (
     <div className="globe-stage">
@@ -463,9 +510,22 @@ const GlobeMap = forwardRef<GlobeMapHandle, Props>(function GlobeMap({ nodes, ce
       {!nodes.length && !failed && <div className="globe-empty">{t('等待具有经纬度的节点接入')}</div>}
       {selected && (
         <div className="globe-popover">
+          {selectionPinned && <button className="globe-popover-close" onClick={closeSelection}>×</button>}
           <b>{selected.name}</b>
           <span>{[selected.city, selected.country].filter(Boolean).join(' · ') || t('未知位置')}</span>
-          <span>IP：{selected.ipMasked || t('IP 待上报')}</span>
+          {selected.members && selected.members.length > 1 ? (
+            <div className="globe-node-picker">
+              {selected.members.map((member) => (
+                <button key={member.id} onClick={() => onSelectNode?.(member.id)}>
+                  <i className={member.online ? 'online' : 'offline'} />
+                  <span>{member.name}</span>
+                  <small>{member.ipMasked || t('IP 待上报')}</small>
+                </button>
+              ))}
+            </div>
+          ) : (
+            <span>IP：{selected.members?.[0]?.ipMasked || selected.ipMasked || t('IP 待上报')}</span>
+          )}
         </div>
       )}
     </div>

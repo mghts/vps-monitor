@@ -7,12 +7,12 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag, for example v0.1.0"
+        description: "Release tag, for example v0.2.0"
         required: true
-        default: "v0.1.0"
+        default: "v0.2.0"
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
@@ -40,7 +40,7 @@ jobs:
         uses: taiki-e/install-action@cross
 
       - name: Build agent
-        run: cross build --release -p vps-monitor-agent --target ${{ matrix.target }}
+        run: cross build --locked --release -p vps-monitor-agent --target ${{ matrix.target }}
 
       - name: Package binary
         run: |
@@ -59,6 +59,8 @@ jobs:
     name: Publish GitHub Release
     runs-on: ubuntu-latest
     needs: build
+    permissions:
+      contents: write
     steps:
       - name: Download artifacts
         uses: actions/download-artifact@v4

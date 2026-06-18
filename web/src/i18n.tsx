@@ -88,9 +88,13 @@ const english: Record<string, string> = {
   '状态': 'Status',
   '内存': 'Memory',
   '磁盘': 'Disk',
+  '资源': 'Resources',
+  '网络': 'Network',
   '网络累计': 'Network Total',
   'Agent 上报的网卡累计计数，通常从系统启动或网卡计数器重置开始。': 'Agent-reported network interface counters, usually since system boot or counter reset.',
   '今日流量': 'Today Traffic',
+  '今日': 'Today',
+  '速率': 'Rate',
   '负载': 'Load',
   '位置': 'Location',
   '在线时长': 'Uptime',
@@ -120,6 +124,8 @@ const english: Record<string, string> = {
   '服务器选择': 'Server',
   '目标选择': 'Target',
   '全部目标': 'All targets',
+  '更多目标': 'More targets',
+  '收起目标': 'Collapse targets',
   '平均延迟': 'Average Latency',
   '平均丢包': 'Average Loss',
   '延迟': 'Latency',
@@ -218,6 +224,9 @@ const english: Record<string, string> = {
   ,'立即刷新': 'Refresh now'
   ,'复位到中心节点': 'Reset to center node'
   ,'未知位置': 'Unknown location'
+  ,'台节点': 'nodes'
+  ,'部分异常': 'Partial issue'
+  ,'选择要查看的节点': 'Choose a node to open'
   ,'正在加载三维地球': 'Loading 3D globe'
   ,'三维地球纹理加载失败': 'Failed to load globe texture'
   ,'等待具有经纬度的节点接入': 'Waiting for nodes with coordinates'

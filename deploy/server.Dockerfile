@@ -8,11 +8,12 @@ RUN npm run build
 FROM rust:1-bookworm AS rust-builder
 WORKDIR /app
 COPY Cargo.toml ./
+COPY Cargo.lock ./
 COPY server/Cargo.toml server/Cargo.toml
 COPY agent/Cargo.toml agent/Cargo.toml
 COPY server server
 COPY agent agent
-RUN cargo build --release -p vps-monitor-server
+RUN cargo build --locked --release -p vps-monitor-server
 
 FROM debian:bookworm-slim
 RUN apt-get update \

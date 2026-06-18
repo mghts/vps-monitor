@@ -1,0 +1,47 @@
+name: Security Audit
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test workspace
+        run: cargo test --locked --workspace
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: Verify RSA is not active
+        run: |
+          if cargo tree -i rsa 2>/dev/null | grep -q '^rsa '; then
+            echo 'rsa unexpectedly entered the active production dependency graph' >&2
+            exit 1
+          fi
+      - name: Audit Rust dependencies
+        # sqlx records its disabled MySQL/RSA optional graph in Cargo.lock. The
+        # previous step fails if rsa ever becomes active in this PostgreSQL-only build.
+        run: cargo audit --ignore RUSTSEC-2023-0071
+
+  web:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+      - run: npm audit
+      - run: npm run build

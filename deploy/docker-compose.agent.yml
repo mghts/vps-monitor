@@ -3,14 +3,20 @@ services:
     image: ${AGENT_IMAGE:-vps-monitor-agent:latest}
     container_name: vps-monitor-agent
     restart: unless-stopped
-    network_mode: host
-    pid: host
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop:
+      - ALL
     cap_add:
       - NET_RAW
+    security_opt:
+      - no-new-privileges:true
     volumes:
-      - /:/host:ro
+      - /etc/hostname:/host/etc/hostname:ro
+      - /etc/os-release:/host/etc/os-release:ro
+      - /proc/net/dev:/host/proc/net/dev:ro
     environment:
       VPS_MONITOR_SERVER_URL: ${VPS_MONITOR_SERVER_URL:?set VPS_MONITOR_SERVER_URL}
       VPS_MONITOR_AGENT_TOKEN: ${VPS_MONITOR_AGENT_TOKEN:?set VPS_MONITOR_AGENT_TOKEN}
       VPS_MONITOR_HOST_ROOT: /host
-

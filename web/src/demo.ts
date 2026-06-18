@@ -5,16 +5,18 @@ const locations = [
   ['Los Angeles-02', '美国', '洛杉矶', 34.0522, -118.2437],
   ['Frankfurt-01', '德国', '法兰克福', 50.1109, 8.6821],
   ['Singapore-03', '新加坡', '新加坡', 1.3521, 103.8198],
+  ['Singapore-04', '新加坡', '新加坡', 1.3521, 103.8198],
+  ['Singapore-Edge', '新加坡', '新加坡', 1.3521, 103.8198],
   ['Sydney-01', '澳大利亚', '悉尼', -33.8688, 151.2093],
   ['Hong Kong-01', '中国', '香港', 22.3193, 114.1694],
   ['Dubai-01', '阿联酋', '迪拜', 25.2048, 55.2708],
   ['São Paulo-01', '巴西', '圣保罗', -23.5505, -46.6333]
 ] as const;
 
-const groups = ['亚洲节点', '美洲节点', '欧洲节点', '亚洲节点', '大洋洲节点', '亚洲节点', '中东节点', '美洲节点'];
+const groups = ['亚洲节点', '美洲节点', '欧洲节点', '亚洲节点', '亚洲节点', '亚洲节点', '大洋洲节点', '亚洲节点', '中东节点', '美洲节点'];
 
 export const demoServers: ServerNode[] = locations.map(([name, country, city, latitude, longitude], index) => {
-  const online = index !== 6;
+  const online = name !== 'Dubai-01';
   const memoryTotal = 8 * 1024 ** 3;
   const diskTotal = 120 * 1024 ** 3;
   return {

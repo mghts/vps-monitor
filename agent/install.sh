@@ -140,6 +140,28 @@ download_file() {
   fi
 }
 
+verify_sha256() {
+  file="$1"
+  checksum_file="$2"
+  expected="$(awk '{print $1}' "$checksum_file" | head -n 1)"
+  if [ -z "$expected" ]; then
+    echo "Agent 校验文件为空，已中止安装。" >&2
+    exit 1
+  fi
+  if command -v sha256sum >/dev/null 2>&1; then
+    actual="$(sha256sum "$file" | awk '{print $1}')"
+  elif command -v shasum >/dev/null 2>&1; then
+    actual="$(shasum -a 256 "$file" | awk '{print $1}')"
+  else
+    echo "系统缺少 sha256sum/shasum，无法验证 Agent 完整性。" >&2
+    exit 1
+  fi
+  if [ "$actual" != "$expected" ]; then
+    echo "Agent SHA-256 校验失败，已中止安装。" >&2
+    exit 1
+  fi
+}
+
 detect_docker_platform() {
   if [ -n "$DOCKER_PLATFORM" ]; then
     echo "$DOCKER_PLATFORM"
@@ -208,11 +230,14 @@ install_native() {
   asset_name="${asset_selection#*|}"
   asset_url="$(release_asset_url "$asset_name")"
   tmp_file="$(mktemp)"
-  trap 'rm -f "$tmp_file"' EXIT
+  checksum_file="$(mktemp)"
+  trap 'rm -f "$tmp_file" "$checksum_file"' EXIT
 
   echo "检测到 native 架构：$native_arch"
   echo "下载 Agent 二进制：$asset_url"
   download_file "$asset_url" "$tmp_file"
+  download_file "${asset_url}.sha256" "$checksum_file"
+  verify_sha256 "$tmp_file" "$checksum_file"
 
   install -d -m 0755 "$NATIVE_DIR"
   install -m 0755 "$tmp_file" "$NATIVE_DIR/vps-monitor-agent"
@@ -238,6 +263,20 @@ EnvironmentFile=$NATIVE_DIR/agent.env
 ExecStart=$NATIVE_DIR/vps-monitor-agent
 Restart=always
 RestartSec=5
+User=nobody
+AmbientCapabilities=CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_RAW
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 
 [Install]
 WantedBy=multi-user.target
@@ -266,10 +305,14 @@ install_docker() {
     --name "$SERVICE_NAME" \
     --platform "$platform" \
     --restart unless-stopped \
-    --network host \
-    --pid host \
+    --read-only \
+    --tmpfs /tmp:rw,noexec,nosuid,size=16m \
+    --cap-drop ALL \
     --cap-add NET_RAW \
-    -v /:/host:ro \
+    --security-opt no-new-privileges:true \
+    -v /etc/hostname:/host/etc/hostname:ro \
+    -v /etc/os-release:/host/etc/os-release:ro \
+    -v /proc/net/dev:/host/proc/net/dev:ro \
     -e VPS_MONITOR_SERVER_URL="$ENDPOINT" \
     -e VPS_MONITOR_AGENT_TOKEN="$TOKEN" \
     -e VPS_MONITOR_HOST_ROOT=/host \
@@ -321,6 +364,25 @@ fi
 
 if [ -z "$TOKEN" ]; then
   echo "缺少 Agent token，请使用 -t <agent-token>。" >&2
+  exit 1
+fi
+
+case "$ENDPOINT" in
+  https://*) ;;
+  http://127.0.0.1*|http://localhost*|http://\[::1\]*) ;;
+  *)
+    echo "中心端地址必须使用 HTTPS（仅本机回环地址允许 HTTP）。" >&2
+    exit 1
+    ;;
+esac
+
+if [ "${#TOKEN}" -lt 32 ] || [ "${#TOKEN}" -gt 512 ]; then
+  echo "Agent token 长度不合法。" >&2
+  exit 1
+fi
+
+if [ "$MODE" = "docker" ] && [[ "$AGENT_IMAGE" == -* ]]; then
+  echo "Agent 镜像名称不合法。" >&2
   exit 1
 fi
 

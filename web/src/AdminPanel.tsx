@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { Children, isValidElement, useEffect, useRef, useState, type ReactNode } from 'react';
 import {
   Bell,
   Check,
@@ -28,6 +28,7 @@ import { api, patchJson, postJson, putJson } from './api';
 import { demoSummary } from './demo';
 import { formatLocation } from './format';
 import { useI18n } from './i18n';
+import { SelectDrawer, type SelectDrawerOption } from './SelectDrawer';
 import type {
   AgentCommands,
   AlertRecord,
@@ -1331,14 +1332,23 @@ function SelectField({
   label: string;
   value: string;
   onChange: (value: string) => void;
-  children: React.ReactNode;
+  children: ReactNode;
 }) {
   const { t } = useI18n();
+  const options = Children.toArray(children).flatMap<SelectDrawerOption>((child) => {
+    if (!isValidElement(child)) return [];
+    const props = child.props as { value?: string | number; children?: ReactNode; disabled?: boolean };
+    return [{
+      value: String(props.value ?? ''),
+      label: props.children,
+      disabled: props.disabled
+    }];
+  });
   return (
-    <label className="field">
+    <div className="field">
       <span>{t(label)}</span>
-      <select value={value} onChange={(event) => onChange(event.target.value)}>{children}</select>
-    </label>
+      <SelectDrawer value={value} onChange={onChange} options={options} className="field-select-drawer" />
+    </div>
   );
 }
 

@@ -7,11 +7,13 @@ export default defineConfig({
     chunkSizeWarningLimit: 600,
     rollupOptions: {
       output: {
-        manualChunks: {
-          react: ['react', 'react-dom'],
-          charts: ['recharts'],
-          maps: ['leaflet', 'react-leaflet'],
-          icons: ['@phosphor-icons/react']
+        manualChunks(id) {
+          if (!id.includes('node_modules')) return undefined;
+          if (id.includes('react-leaflet') || id.includes('/leaflet/')) return 'maps';
+          if (id.includes('/recharts/')) return 'charts';
+          if (id.includes('@phosphor-icons')) return 'icons';
+          if (id.includes('/react/') || id.includes('/react-dom/')) return 'react';
+          return undefined;
         }
       }
     }
