@@ -75,8 +75,8 @@
 | --- | --- | --- |
 | `BASE_URL` | `https://monitor.example.com` | 必须是浏览器和 Agent 都能访问的公开地址，不要写 `127.0.0.1` |
 | `SERVER_PORT` | `127.0.0.1:8080` | 推荐只监听本机，让 Nginx 对外暴露 80/443 |
-| `SERVER_IMAGE` | `alice/vps-monitor-server:v0.2.1` | 中心端镜像 |
-| `AGENT_IMAGE` | `alice/vps-monitor-agent:v0.2.1` | Docker Agent 镜像 |
+| `SERVER_IMAGE` | `alice/vps-monitor-server:v0.2.2` | 中心端镜像 |
+| `AGENT_IMAGE` | `alice/vps-monitor-agent:v0.2.2` | Docker Agent 镜像 |
 | `AGENT_INSTALLER_URL` | `https://raw.githubusercontent.com/mghts/vps-monitor/refs/heads/main/agent/install.sh` | 后台生成一键安装命令时使用 |
 | `AGENT_RELEASE_REPOSITORY` | 留空或 `mghts/vps-monitor` | systemd/native Agent 的 GitHub Release 仓库，当前脚本默认已写入 `mghts/vps-monitor` |
 | `COOKIE_SECURE` | `true` | 正式 HTTPS 部署保持 `true`；纯 HTTP 临时测试才改成 `false` |
@@ -85,8 +85,8 @@
 
 你需要先把两个镜像发布到 Docker Hub：
 
-- `<你的 DockerHub 用户名>/vps-monitor-server:v0.2.1`
-- `<你的 DockerHub 用户名>/vps-monitor-agent:v0.2.1`
+- `<你的 DockerHub 用户名>/vps-monitor-server:v0.2.2`
+- `<你的 DockerHub 用户名>/vps-monitor-agent:v0.2.2`
 
 Docker Hub 的账号、仓库和 Access Token 需要你自己创建。原因很简单：这是你的账号凭据，不能写进项目，也不应该交给别人保管。你创建好 token 后，GitHub Actions 会自动帮你构建并推送镜像。
 
@@ -106,8 +106,8 @@ vps-monitor-agent
 假设你的 Docker Hub 用户名是 `alice`，那么最终镜像名就是：
 
 ```text
-alice/vps-monitor-server:v0.2.1
-alice/vps-monitor-agent:v0.2.1
+alice/vps-monitor-server:v0.2.2
+alice/vps-monitor-agent:v0.2.2
 ```
 
 仓库建议设为 `Public`。如果你设为 `Private`，中心端 VPS 和各个 Agent VPS 拉取镜像前都需要先 `docker login`，部署会麻烦很多。
@@ -171,24 +171,24 @@ https://github.com/mghts/vps-monitor/settings/secrets/actions
 Publish Docker Images
 ```
 
-如果你已经推送了 `v0.2.1` tag，这一步会自动运行，无需再次手动触发。只有自动任务没有出现时，才点击 `Run workflow`：
+如果你已经推送了 `v0.2.2` tag，这一步会自动运行，无需再次手动触发。只有自动任务没有出现时，才点击 `Run workflow`：
 
 ```text
-version     = v0.2.1
+version     = v0.2.2
 push_latest = 勾选
 ```
 
 然后点击绿色的 `Run workflow` 按钮，等待任务完成。
 
-`v0.2.1` 是当前文档对应的正式版本。每次推送新的 `v*` tag（例如 `v0.2.2`）后，GitHub Actions 都会自动发布同版本 Docker 镜像和 Agent 二进制；不要重复使用旧 tag 覆盖新代码。
+`v0.2.2` 是当前文档对应的正式版本。每次推送新的 `v*` tag（例如 `v0.2.2`）后，GitHub Actions 都会自动发布同版本 Docker 镜像和 Agent 二进制；不要重复使用旧 tag 覆盖新代码。
 
 #### 1.5 检查镜像是否发布成功
 
 在 Mac 或任意装了 Docker 的机器上执行：
 
 ```bash
-docker buildx imagetools inspect <你的 DockerHub 用户名>/vps-monitor-server:v0.2.1
-docker buildx imagetools inspect <你的 DockerHub 用户名>/vps-monitor-agent:v0.2.1
+docker buildx imagetools inspect <你的 DockerHub 用户名>/vps-monitor-server:v0.2.2
+docker buildx imagetools inspect <你的 DockerHub 用户名>/vps-monitor-agent:v0.2.2
 ```
 
 输出里应该能看到：
@@ -205,11 +205,11 @@ linux/arm64
 后面创建 `.env` 时，把镜像写成固定版本：
 
 ```env
-SERVER_IMAGE=<你的 DockerHub 用户名>/vps-monitor-server:v0.2.1
-AGENT_IMAGE=<你的 DockerHub 用户名>/vps-monitor-agent:v0.2.1
+SERVER_IMAGE=<你的 DockerHub 用户名>/vps-monitor-server:v0.2.2
+AGENT_IMAGE=<你的 DockerHub 用户名>/vps-monitor-agent:v0.2.2
 ```
 
-不建议生产环境长期使用 `latest`。`latest` 适合测试，但一旦你以后发布新镜像，VPS 重新 `docker compose pull` 时可能直接升级，出了问题不好回滚。固定 `v0.2.1` 这种版本号更稳。
+不建议生产环境长期使用 `latest`。`latest` 适合测试，但一旦你以后发布新镜像，VPS 重新 `docker compose pull` 时可能直接升级，出了问题不好回滚。固定 `v0.2.2` 这种版本号更稳。
 
 ### 备用方式：本地手动 buildx 推送
 
@@ -233,7 +233,7 @@ docker buildx inspect --bootstrap
 docker buildx build \
   --platform linux/amd64,linux/arm64 \
   -f deploy/server.Dockerfile \
-  -t <你的 DockerHub 用户名>/vps-monitor-server:v0.2.1 \
+  -t <你的 DockerHub 用户名>/vps-monitor-server:v0.2.2 \
   -t <你的 DockerHub 用户名>/vps-monitor-server:latest \
   --push \
   .
@@ -241,13 +241,13 @@ docker buildx build \
 docker buildx build \
   --platform linux/amd64,linux/arm64 \
   -f deploy/agent.Dockerfile \
-  -t <你的 DockerHub 用户名>/vps-monitor-agent:v0.2.1 \
+  -t <你的 DockerHub 用户名>/vps-monitor-agent:v0.2.2 \
   -t <你的 DockerHub 用户名>/vps-monitor-agent:latest \
   --push \
   .
 
-docker buildx imagetools inspect <你的 DockerHub 用户名>/vps-monitor-server:v0.2.1
-docker buildx imagetools inspect <你的 DockerHub 用户名>/vps-monitor-agent:v0.2.1
+docker buildx imagetools inspect <你的 DockerHub 用户名>/vps-monitor-server:v0.2.2
+docker buildx imagetools inspect <你的 DockerHub 用户名>/vps-monitor-agent:v0.2.2
 ```
 
 检查输出里应该同时能看到 `linux/amd64` 和 `linux/arm64`。如果你的 VPS 是普通 x86_64，一定要至少包含 `linux/amd64`。
@@ -260,18 +260,18 @@ docker login
 docker buildx build \
   --platform linux/amd64 \
   -f deploy/server.Dockerfile \
-  -t <你的 DockerHub 用户名>/vps-monitor-server:v0.2.1 \
+  -t <你的 DockerHub 用户名>/vps-monitor-server:v0.2.2 \
   --push \
   .
 
 docker buildx build \
   --platform linux/amd64 \
   -f deploy/agent.Dockerfile \
-  -t <你的 DockerHub 用户名>/vps-monitor-agent:v0.2.1 \
+  -t <你的 DockerHub 用户名>/vps-monitor-agent:v0.2.2 \
   --push \
   .
 
-docker buildx imagetools inspect <你的 DockerHub 用户名>/vps-monitor-agent:v0.2.1
+docker buildx imagetools inspect <你的 DockerHub 用户名>/vps-monitor-agent:v0.2.2
 ```
 
 如果你还想用非 Docker/systemd Agent，不需要在中心端放二进制文件。推荐把本项目推到 GitHub，然后用本项目自带的 `.github/workflows/release-agent.yml` 自动编译并发布 GitHub Releases。中心端只需要在 `.env` 里配置 GitHub raw 安装脚本地址和 Releases 仓库名。
@@ -354,14 +354,14 @@ SETUP_TOKEN=换成超长随机首次注册令牌
 BASE_URL=https://monitor.example.com
 SERVER_PORT=127.0.0.1:8080
 
-SERVER_IMAGE=<你的 DockerHub 用户名>/vps-monitor-server:v0.2.1
-AGENT_IMAGE=<你的 DockerHub 用户名>/vps-monitor-agent:v0.2.1
+SERVER_IMAGE=<你的 DockerHub 用户名>/vps-monitor-server:v0.2.2
+AGENT_IMAGE=<你的 DockerHub 用户名>/vps-monitor-agent:v0.2.2
 
 # Agent 一键安装脚本，建议放在你的 GitHub 仓库。
 AGENT_INSTALLER_URL=https://raw.githubusercontent.com/mghts/vps-monitor/refs/heads/main/agent/install.sh
 # systemd/native Agent 二进制从这个 GitHub Releases 仓库下载。
 AGENT_RELEASE_REPOSITORY=
-# latest 表示使用最新 release；也可以固定为 v0.2.1。
+# latest 表示使用最新 release；也可以固定为 v0.2.2。
 AGENT_RELEASE_TAG=latest
 
 GEOIP_MMDB_PATH=/data/GeoLite2-City.mmdb
@@ -380,7 +380,7 @@ RUST_LOG=info
 - `AGENT_IMAGE` 是 Docker 版 Agent 一键安装命令使用的镜像，建议和中心端使用同一个版本号。
 - `AGENT_INSTALLER_URL` 是后台生成 Agent 安装命令时使用的脚本地址，推荐使用 GitHub raw 链接。
 - `AGENT_RELEASE_REPOSITORY` 是 systemd/native Agent 二进制所在的 GitHub Releases 仓库。当前 `agent/install.sh` 已默认使用 `mghts/vps-monitor`，所以这里可以留空以保持安装命令更短。
-- `AGENT_RELEASE_TAG=latest` 表示安装最新 release；如果你希望所有节点固定版本，可以写成 `v0.2.1`。
+- `AGENT_RELEASE_TAG=latest` 表示安装最新 release；如果你希望所有节点固定版本，可以写成 `v0.2.2`。
 - 当前 `agent/install.sh` 顶部的 `DEFAULT_RELEASE_REPO` 已固定为 `mghts/vps-monitor`。因此中心端 `.env` 里的 `AGENT_RELEASE_REPOSITORY` 可以留空，后台生成的 systemd 安装命令会保持 `wget ...install.sh | sudo bash -s -- -e ... -t ...` 这种 Komari 风格。
 - `SERVER_PORT=127.0.0.1:8080` 表示中心端只暴露给本机 Nginx。
 - `COOKIE_SECURE=true` 表示浏览器只会在 HTTPS 下发送管理员登录 Cookie。正式部署必须保持 `true`。如果你临时用纯 HTTP 测试登录，可以临时改成 `false`，测试完再改回 `true`。
@@ -561,13 +561,13 @@ journalctl -u vps-monitor-agent -n 100 --no-pager
 方式一：推送新的 tag 自动发布（推荐）：
 
 ```bash
-git tag v0.2.1
-git push origin v0.2.1
+git tag v0.2.2
+git push origin v0.2.2
 ```
 
 同一个 tag 只创建一次。下一次发布请递增版本号，例如 `v0.2.2`，不要删除并重建已有 tag。
 
-方式二：在 GitHub 仓库页面进入 `Actions -> Release Agent Binaries -> Run workflow`，填写 tag，例如 `v0.2.1`。
+方式二：在 GitHub 仓库页面进入 `Actions -> Release Agent Binaries -> Run workflow`，填写 tag，例如 `v0.2.2`。
 
 Workflow 会生成并上传这些 release assets：
 
@@ -681,7 +681,7 @@ docker compose logs -f server
 如果你修改了 Web UI 但 VPS 上仍然显示旧主题，优先检查这几件事：
 
 1. `Publish Docker Images` workflow 是否已经成功完成。
-2. `.env` 里的 `SERVER_IMAGE` 是否还是旧 tag。当前版本应使用 `vps-monitor-server:v0.2.1`，更新 `.env` 后再执行 `docker compose pull && docker compose up -d --force-recreate`。
+2. `.env` 里的 `SERVER_IMAGE` 是否还是旧 tag。当前版本应使用 `vps-monitor-server:v0.2.2`，更新 `.env` 后再执行 `docker compose pull && docker compose up -d --force-recreate`。
 3. 在 VPS 上执行 `docker compose images`，确认 `server` 使用的是刚推送的新镜像。
 4. 浏览器强制刷新页面；如果前面套了 CDN 或额外 Nginx 缓存，也需要清掉缓存。默认教程里的 Nginx 反代不主动缓存静态文件。
 
@@ -745,16 +745,16 @@ exec /usr/local/bin/vps-monitor-agent: exec format error
 docker buildx build \
   --platform linux/amd64,linux/arm64 \
   -f deploy/agent.Dockerfile \
-  -t <你的 DockerHub 用户名>/vps-monitor-agent:v0.2.1 \
+  -t <你的 DockerHub 用户名>/vps-monitor-agent:v0.2.2 \
   --push \
   .
 
-docker buildx imagetools inspect <你的 DockerHub 用户名>/vps-monitor-agent:v0.2.1
+docker buildx imagetools inspect <你的 DockerHub 用户名>/vps-monitor-agent:v0.2.2
 ```
 
 然后在出错的目标 VPS 上删除坏容器并重新执行后台生成的 Agent 安装命令：
 
 ```bash
 docker rm -f vps-monitor-agent
-docker image rm <你的 DockerHub 用户名>/vps-monitor-agent:v0.2.1
+docker image rm <你的 DockerHub 用户名>/vps-monitor-agent:v0.2.2
 ```

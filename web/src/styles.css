@@ -1740,6 +1740,10 @@ code {
   min-height: 388px;
 }
 
+.roster-surface {
+  container-type: inline-size;
+}
+
 .dashboard-secondary > .roster-surface:not(.expanded),
 .dashboard-secondary > .ping-surface:not(.expanded) {
   height: 468px;
@@ -1798,7 +1802,7 @@ code {
 
 .roster-toolbar {
   display: grid;
-  grid-template-columns: minmax(126px, 1fr) auto minmax(126px, 1fr) auto;
+  grid-template-columns: minmax(112px, 150px) auto minmax(112px, 150px) minmax(170px, 1fr) auto;
   align-items: center;
   gap: 8px;
   min-height: 42px;
@@ -1834,6 +1838,18 @@ code {
   width: auto;
 }
 
+.roster-refresh-summary {
+  min-width: 0;
+  justify-self: end;
+  margin: 0;
+  color: var(--muted);
+  font-family: var(--font-hand);
+  font-size: 11px;
+  line-height: 1.2;
+  text-align: right;
+  white-space: nowrap;
+}
+
 .roster-toolbar .roster-check {
   justify-self: center;
   height: 30px;
@@ -1848,6 +1864,19 @@ code {
 .roster-toolbar .segmented.icon-only button {
   width: 30px;
   height: 30px;
+}
+
+@container (max-width: 720px) {
+  .roster-toolbar {
+    grid-template-columns: minmax(112px, 1fr) auto minmax(112px, 1fr) auto;
+  }
+
+  .roster-refresh-summary {
+    grid-column: 1 / -1;
+    grid-row: 2;
+    justify-self: start;
+    text-align: left;
+  }
 }
 
 .icon-select {

@@ -538,18 +538,16 @@ function WorldMapPanel({
                       {cluster.servers.map((server) => (
                         <span className="cluster-node-line" key={server.id}>
                           <i className={server.online ? 'online' : 'offline'} />
-                          {server.name} · {server.online ? t('在线') : t('离线')} · {server.ip_masked || t('IP 待上报')}
-                          {center && serverIsCenter(server) ? ` · ${t('同时也是中心节点')}` : ''}
+                          {server.name}{center && serverIsCenter(server) ? ` ${t('（中心节点）')}` : ''} · {server.online ? t('在线') : t('离线')} · {server.ip_masked || t('IP 待上报')}
                         </span>
                       ))}
                     </LeafletTooltip>
                     <Popup className="map-cluster-popup">
                       {cluster.servers.length === 1 ? (
                         <>
-                          <b>{cluster.servers[0].name}</b><br />
+                          <b>{cluster.servers[0].name}{center && serverIsCenter(cluster.servers[0]) ? ` ${t('（中心节点）')}` : ''}</b><br />
                           {serverLocationLabel(cluster.servers[0], t, t('未知位置'))}<br />
                           {cluster.servers[0].online ? t('在线') : t('离线')}
-                          {center && serverIsCenter(cluster.servers[0]) && <><br />{t('同时也是中心节点')}</>}
                         </>
                       ) : (
                         <div className="map-cluster-picker">
@@ -558,8 +556,8 @@ function WorldMapPanel({
                           {cluster.servers.map((server) => (
                             <button key={server.id} onClick={() => onSelectServer(server.id)}>
                               <i className={server.online ? 'online' : 'offline'} />
-                              <span>{server.name}</span>
-                              <small>{server.ip_masked || t('IP 待上报')}{center && serverIsCenter(server) ? ` · ${t('中心节点')}` : ''}</small>
+                              <span>{server.name}{center && serverIsCenter(server) ? ` ${t('（中心节点）')}` : ''}</span>
+                              <small>{server.ip_masked || t('IP 待上报')}</small>
                             </button>
                           ))}
                         </div>
@@ -883,12 +881,11 @@ function ServerRoster({
   );
   return (
     <section className={`surface roster-surface view-${view} ${expanded ? 'expanded' : ''}`}>
-      <div className="surface-header roster-header">
-        <div>
-          {!expanded && <h2>{t('节点清单')}</h2>}
-          <p>{t('显示 {count} / {total} 台', { count: filtered.length, total: servers.length })} · {t('每 {seconds} 秒动态刷新', { seconds: refreshIntervalSeconds })}</p>
+      {!expanded && (
+        <div className="surface-header roster-header">
+          <div><h2>{t('节点清单')}</h2></div>
         </div>
-      </div>
+      )}
       <div className="roster-toolbar">
         <SelectDrawer
           className="roster-filter-select roster-group-select"
@@ -927,6 +924,9 @@ function ServerRoster({
             { value: 'offline', label: t('离线') }
           ]}
         />
+        <p className="roster-refresh-summary">
+          {t('显示 {count} / {total} 台', { count: filtered.length, total: servers.length })} · {t('每 {seconds} 秒动态刷新', { seconds: refreshIntervalSeconds })}
+        </p>
         <div className="segmented icon-only">
           <button className={view === 'table' ? 'active' : ''} onClick={() => { setView('table'); window.localStorage.setItem('vps-monitor-server-view', 'table'); }} title={t('列表视图')}>
             <ListBullets size={17} />

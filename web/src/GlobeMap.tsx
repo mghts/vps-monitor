@@ -1,6 +1,8 @@
 import { forwardRef, useEffect, useImperativeHandle, useMemo, useRef, useState } from 'react';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
+import countriesTopology from 'world-atlas/countries-110m.json';
+import { mesh as topojsonMesh } from 'topojson-client';
 import { useI18n } from './i18n';
 
 export type GlobeNodeMember = {
@@ -48,13 +50,74 @@ export type GlobeMapHandle = {
   resetView: () => void;
 };
 
+const GLOBE_SURFACE_RADIUS = 1.006;
+const GLOBE_ARC_RADIUS = 1.018;
+type GeoLineCollection = { coordinates: number[][][] };
+
+const worldTopology = countriesTopology as unknown as {
+  objects: { countries: unknown };
+};
+const countryCoastlines = topojsonMesh(
+  worldTopology as never,
+  worldTopology.objects.countries as never,
+  (left, right) => left === right
+) as GeoLineCollection;
+const countryBorders = topojsonMesh(
+  worldTopology as never,
+  worldTopology.objects.countries as never,
+  (left, right) => left !== right
+) as GeoLineCollection;
+
 function latLngToVector(latitude: number, longitude: number, radius: number) {
-  const phi = (90 - latitude) * Math.PI / 180;
-  const theta = (longitude + 180) * Math.PI / 180;
+  const normalizedLatitude = THREE.MathUtils.clamp(latitude, -90, 90);
+  const normalizedLongitude = THREE.MathUtils.euclideanModulo(longitude + 180, 360) - 180;
+  const phi = (90 - normalizedLatitude) * Math.PI / 180;
+  const theta = (normalizedLongitude + 180) * Math.PI / 180;
   return new THREE.Vector3(
     -radius * Math.sin(phi) * Math.cos(theta),
     radius * Math.cos(phi),
     radius * Math.sin(phi) * Math.sin(theta)
+  );
+}
+
+function placeSurfaceMarker(mesh: THREE.Mesh, position: THREE.Vector3) {
+  mesh.position.copy(position);
+  mesh.lookAt(position.clone().multiplyScalar(2));
+}
+
+function createGeoLines(lines: number[][][], radius: number, color: number, opacity: number) {
+  const group = new THREE.Group();
+  lines.forEach((line) => {
+    const points = line
+      .filter(([longitude, latitude]) => Number.isFinite(latitude) && Number.isFinite(longitude))
+      .map(([longitude, latitude]) => latLngToVector(latitude, longitude, radius));
+    if (points.length < 2) return;
+    const geometry = new THREE.BufferGeometry().setFromPoints(points);
+    const material = new THREE.LineBasicMaterial({
+      color,
+      transparent: true,
+      opacity,
+      depthWrite: false,
+      depthTest: true
+    });
+    group.add(new THREE.Line(geometry, material));
+  });
+  return group;
+}
+
+function createGraticule(theme: 'dark' | 'light') {
+  const lines: number[][][] = [];
+  for (let latitude = -60; latitude <= 60; latitude += 30) {
+    lines.push(Array.from({ length: 181 }, (_, index) => [-180 + index * 2, latitude]));
+  }
+  for (let longitude = -150; longitude <= 180; longitude += 30) {
+    lines.push(Array.from({ length: 81 }, (_, index) => [longitude, -80 + index * 2]));
+  }
+  return createGeoLines(
+    lines,
+    1.0025,
+    theme === 'light' ? 0x7ea29d : 0x6f9c98,
+    theme === 'light' ? 0.13 : 0.18
   );
 }
 
@@ -199,7 +262,6 @@ const GlobeMap = forwardRef<GlobeMapHandle, Props>(function GlobeMap({ nodes, ce
   const markerMaterialsRef = useRef(new Map<string, THREE.MeshBasicMaterial>());
   const [selected, setSelected] = useState<GlobeNode | null>(null);
   const [selectionPinned, setSelectionPinned] = useState(false);
-  const [failed, setFailed] = useState(false);
   const geometryKey = useMemo(
     () => [
       center ? `${center.latitude}:${center.longitude}:${center.name}:${center.city || ''}:${center.region || ''}:${center.country || ''}:${center.ipMasked || ''}` : 'no-center',
@@ -237,25 +299,33 @@ const GlobeMap = forwardRef<GlobeMapHandle, Props>(function GlobeMap({ nodes, ce
     const globeGroup = new THREE.Group();
     scene.add(globeGroup);
 
-    const texture = new THREE.TextureLoader().load(
-      theme === 'light' ? '/assets/earth-light-equirectangular.png' : '/assets/earth-dark-equirectangular.png',
-      () => {
-        texture.colorSpace = THREE.SRGBColorSpace;
-        texture.needsUpdate = true;
-      },
-      undefined,
-      () => setFailed(true)
-    );
     const globe = new THREE.Mesh(
-      new THREE.SphereGeometry(1, 96, 64),
+      new THREE.SphereGeometry(1, 128, 96),
       new THREE.MeshStandardMaterial({
-        map: texture,
-        roughness: 0.88,
-        metalness: 0.05,
-        color: theme === 'light' ? 0xf0eadb : 0xcbbf9f
+        roughness: 0.9,
+        metalness: 0,
+        color: theme === 'light' ? 0xcfded8 : 0x21312d,
+        emissive: theme === 'light' ? 0x6f9c92 : 0x15231f,
+        emissiveIntensity: theme === 'light' ? 0.035 : 0.12
       })
     );
     globeGroup.add(globe);
+
+    globeGroup.add(
+      createGraticule(theme),
+      createGeoLines(
+        countryCoastlines.coordinates,
+        1.004,
+        theme === 'light' ? 0x4f8179 : 0x98c9c0,
+        theme === 'light' ? 0.76 : 0.8
+      ),
+      createGeoLines(
+        countryBorders.coordinates,
+        1.0035,
+        theme === 'light' ? 0x89aaa2 : 0x6e9b93,
+        theme === 'light' ? 0.3 : 0.42
+      )
+    );
 
     const atmosphere = new THREE.Mesh(
       new THREE.SphereGeometry(1.018, 96, 64),
@@ -268,8 +338,13 @@ const GlobeMap = forwardRef<GlobeMapHandle, Props>(function GlobeMap({ nodes, ce
     );
     globeGroup.add(atmosphere);
 
-    scene.add(new THREE.AmbientLight(theme === 'light' ? 0xfff8e8 : 0xded1b5, theme === 'light' ? 2 : 1.45));
-    const keyLight = new THREE.DirectionalLight(theme === 'light' ? 0xfffbef : 0xf0e5cf, theme === 'light' ? 2.2 : 2.5);
+    scene.add(new THREE.AmbientLight(theme === 'light' ? 0xfff8e8 : 0xded1b5, theme === 'light' ? 1.35 : 1.15));
+    scene.add(new THREE.HemisphereLight(
+      theme === 'light' ? 0xfff7e7 : 0xa9d0c7,
+      theme === 'light' ? 0x91afa7 : 0x111916,
+      theme === 'light' ? 0.72 : 0.62
+    ));
+    const keyLight = new THREE.DirectionalLight(theme === 'light' ? 0xfff7e5 : 0xe7deca, theme === 'light' ? 1.65 : 1.9);
     keyLight.position.set(-2, 2, 3);
     scene.add(keyLight);
 
@@ -281,16 +356,22 @@ const GlobeMap = forwardRef<GlobeMapHandle, Props>(function GlobeMap({ nodes, ce
       speed: number;
     }> = [];
     markerMaterialsRef.current.clear();
-    const centerPosition = center
-      ? latLngToVector(center.latitude, center.longitude, 1.018)
+    const centerSurfacePosition = center
+      ? latLngToVector(center.latitude, center.longitude, GLOBE_SURFACE_RADIUS)
+      : null;
+    const centerArcPosition = center
+      ? latLngToVector(center.latitude, center.longitude, GLOBE_ARC_RADIUS)
       : null;
 
-    if (centerPosition) {
+    if (centerSurfacePosition) {
       const centerMarker = new THREE.Mesh(
-        new THREE.SphereGeometry(0.043, 24, 24),
-        new THREE.MeshBasicMaterial({ color: theme === 'light' ? 0x4ea3a1 : 0x7dc9c2 })
+        new THREE.CircleGeometry(0.043, 32),
+        new THREE.MeshBasicMaterial({
+          color: theme === 'light' ? 0x4ea3a1 : 0x7dc9c2,
+          side: THREE.DoubleSide
+        })
       ) as THREE.Mesh & { userData: { node?: GlobeNode } };
-      centerMarker.position.copy(centerPosition);
+      placeSurfaceMarker(centerMarker, centerSurfacePosition);
       if (!nodes.some((node) => node.isCenter)) {
         centerMarker.userData.node = {
           id: '__center__',
@@ -310,10 +391,13 @@ const GlobeMap = forwardRef<GlobeMapHandle, Props>(function GlobeMap({ nodes, ce
       globeGroup.add(centerMarker);
 
       const centerCore = new THREE.Mesh(
-        new THREE.SphereGeometry(0.022, 18, 18),
-        new THREE.MeshBasicMaterial({ color: theme === 'light' ? 0xfffdf6 : 0xefe6d2 })
+        new THREE.CircleGeometry(0.021, 24),
+        new THREE.MeshBasicMaterial({
+          color: theme === 'light' ? 0xfffdf6 : 0xefe6d2,
+          side: THREE.DoubleSide
+        })
       );
-      centerCore.position.copy(centerPosition.clone().multiplyScalar(1.002));
+      placeSurfaceMarker(centerCore, centerSurfacePosition.clone().multiplyScalar(1.001));
       globeGroup.add(centerCore);
 
       const halo = new THREE.Mesh(
@@ -325,8 +409,7 @@ const GlobeMap = forwardRef<GlobeMapHandle, Props>(function GlobeMap({ nodes, ce
           side: THREE.DoubleSide
         })
       );
-      halo.position.copy(centerPosition.clone().multiplyScalar(1.006));
-      halo.lookAt(centerPosition.clone().multiplyScalar(2));
+      placeSurfaceMarker(halo, centerSurfacePosition.clone().multiplyScalar(1.002));
       globeGroup.add(halo);
 
       const outerHalo = new THREE.Mesh(
@@ -338,31 +421,32 @@ const GlobeMap = forwardRef<GlobeMapHandle, Props>(function GlobeMap({ nodes, ce
           side: THREE.DoubleSide
         })
       );
-      outerHalo.position.copy(centerPosition.clone().multiplyScalar(1.007));
-      outerHalo.lookAt(centerPosition.clone().multiplyScalar(2));
+      placeSurfaceMarker(outerHalo, centerSurfacePosition.clone().multiplyScalar(1.003));
       globeGroup.add(outerHalo);
     }
 
     nodes.forEach((node) => {
-      const position = latLngToVector(node.latitude, node.longitude, 1.025);
+      const surfacePosition = latLngToVector(node.latitude, node.longitude, GLOBE_SURFACE_RADIUS);
+      const arcPosition = latLngToVector(node.latitude, node.longitude, GLOBE_ARC_RADIUS);
       const status = node.status || (node.online ? 'online' : 'offline');
       const memberCount = node.members?.length || 1;
       const markerMaterial = new THREE.MeshBasicMaterial({
         color: globeStatusColor(status, node.online, theme)
       });
       const marker = new THREE.Mesh(
-        new THREE.SphereGeometry(Math.min(0.036, (status === 'offline' ? 0.028 : 0.022) + Math.max(0, memberCount - 1) * 0.0035), 18, 18),
+        new THREE.CircleGeometry(Math.min(0.036, (status === 'offline' ? 0.028 : 0.022) + Math.max(0, memberCount - 1) * 0.0035), 24),
         markerMaterial
       ) as THREE.Mesh & { userData: { node?: GlobeNode } };
-      marker.position.copy(position);
+      markerMaterial.side = THREE.DoubleSide;
+      placeSurfaceMarker(marker, surfacePosition);
       marker.userData.node = node;
       nodeMeshes.push(marker);
       markerMaterialsRef.current.set(node.id, markerMaterial);
       globeGroup.add(marker);
 
-      if (centerPosition && node.id !== 'center' && centerPosition.angleTo(position) > 0.01) {
+      if (centerArcPosition && node.id !== 'center' && centerArcPosition.angleTo(arcPosition) > 0.01) {
         const color = globeLineColor(status, node.online, theme);
-        const arc = createArc(centerPosition, position, color);
+        const arc = createArc(centerArcPosition, arcPosition, color);
         globeGroup.add(arc.group);
         if (status !== 'offline') {
           [0, 0.42].forEach((offset, particleIndex) => {
@@ -517,13 +601,12 @@ const GlobeMap = forwardRef<GlobeMapHandle, Props>(function GlobeMap({ nodes, ce
       controls.dispose();
       timer.dispose();
       scene.traverse((object) => {
-        if (object instanceof THREE.Mesh) {
+        if (object instanceof THREE.Mesh || object instanceof THREE.Line) {
           object.geometry.dispose();
           const materials = Array.isArray(object.material) ? object.material : [object.material];
           materials.forEach((material) => material.dispose());
         }
       });
-      texture.dispose();
       renderer.dispose();
       renderer.domElement.remove();
       markerMaterialsRef.current.clear();
@@ -571,16 +654,15 @@ const GlobeMap = forwardRef<GlobeMapHandle, Props>(function GlobeMap({ nodes, ce
   return (
     <div className="globe-stage">
       <div ref={mountRef} className="globe-canvas" />
-      {failed && <div className="map-empty">{t('三维地球纹理加载失败')}</div>}
-      {!nodes.length && !center && !failed && <div className="globe-empty">{t('等待具有经纬度的节点接入')}</div>}
+      {!nodes.length && !center && <div className="globe-empty">{t('等待具有经纬度的节点接入')}</div>}
       {selected && (
         <div className="globe-popover">
           {selectionPinned && <button className="globe-popover-close" onClick={closeSelection}>×</button>}
-          <b>{selected.name}</b>
+          <b>{selected.name}{selected.isCenter && selected.members?.length ? ` ${t('（中心节点）')}` : ''}</b>
           <span>{[selected.city, selected.region, selected.country].filter(Boolean).join(' · ') || t('未知位置')}</span>
-          {selected.isCenter && (
+          {selected.isCenter && !selected.members?.length && (
             <span className="center-node-note">
-              {selected.members?.length ? t('同时也是中心节点') : t('中心节点')}
+              {t('中心节点')}
             </span>
           )}
           {selected.members && selected.members.length > 1 ? (
@@ -588,8 +670,8 @@ const GlobeMap = forwardRef<GlobeMapHandle, Props>(function GlobeMap({ nodes, ce
               {selected.members.map((member) => (
                 <button key={member.id} onClick={() => onSelectNodeRef.current?.(member.id)}>
                   <i className={member.online ? 'online' : 'offline'} />
-                  <span>{member.name}</span>
-                  <small>{member.ipMasked || t('IP 待上报')}{member.isCenter ? ` · ${t('中心节点')}` : ''}</small>
+                  <span>{member.name}{member.isCenter ? ` ${t('（中心节点）')}` : ''}</span>
+                  <small>{member.ipMasked || t('IP 待上报')}</small>
                 </button>
               ))}
             </div>

@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Docker image tag, for example v0.2.1"
+        description: "Docker image tag, for example v0.2.2"
         required: true
-        default: "v0.2.1"
+        default: "v0.2.2"
       push_latest:
         description: "Also push the latest tag"
         required: true
