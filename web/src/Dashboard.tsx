@@ -937,7 +937,7 @@ function ServerRoster({
         </div>
       </div>
       {!filtered.length ? (
-        <EmptyState icon={<Rows size={28} />} title={t('没有符合条件的服务器')} detail={t('调整筛选条件，或在管理后台添加节点。')} />
+        <EmptyState icon={<Rows size={28} />} title={t('没有符合条件的服务器')} />
       ) : view === 'table' ? (
         <div className="table-scroll">
           <table className="node-table">
@@ -1485,7 +1485,7 @@ function PingPanel({
       )}
       {error && <div className="inline-error">{error}</div>}
       {!summary.servers.length ? (
-        <EmptyState icon={<Pulse size={28} />} title={t('还没有 Ping 数据')} detail={t('接入服务器并配置 Ping 目标后，这里会显示延迟和丢包曲线。')} />
+        <EmptyState icon={<Pulse size={28} />} title={t('还没有 Ping 数据')} />
       ) : (
         <div className="ping-chart">
           <ResponsiveContainer width="100%" height="100%">
@@ -1622,12 +1622,12 @@ function formatDetailAxisTime(value: string, range: string, language: 'zh' | 'en
   return date.toLocaleDateString(locale, { month: '2-digit', day: '2-digit' });
 }
 
-function EmptyState({ icon, title, detail }: { icon: React.ReactNode; title: string; detail: string }) {
+function EmptyState({ icon, title, detail }: { icon: React.ReactNode; title: string; detail?: string }) {
   return (
     <div className="empty-state">
       <div className="empty-icon">{icon}</div>
       <b>{title}</b>
-      <span>{detail}</span>
+      {detail && <span>{detail}</span>}
     </div>
   );
 }

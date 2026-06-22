@@ -1868,12 +1868,32 @@ code {
 
 @container (max-width: 720px) {
   .roster-toolbar {
-    grid-template-columns: minmax(112px, 1fr) auto minmax(112px, 1fr) auto;
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .roster-toolbar .roster-group-select {
+    grid-column: 1;
+    grid-row: 1;
+  }
+
+  .roster-toolbar .roster-check {
+    grid-column: 2;
+    grid-row: 1;
+  }
+
+  .roster-toolbar .roster-status-select {
+    grid-column: 1;
+    grid-row: 2;
+  }
+
+  .roster-toolbar .segmented.icon-only {
+    grid-column: 2;
+    grid-row: 2;
   }
 
   .roster-refresh-summary {
     grid-column: 1 / -1;
-    grid-row: 2;
+    grid-row: 3;
     justify-self: start;
     text-align: left;
   }
@@ -3970,8 +3990,13 @@ tbody tr:last-child td {
   .sidebar {
     position: fixed;
     left: 0;
+    height: 100dvh;
+    min-height: 0;
+    overflow-y: auto;
+    overscroll-behavior: contain;
     transform: translateX(-102%);
     width: 230px;
+    -webkit-overflow-scrolling: touch;
     transition: transform 200ms ease;
   }
 
@@ -4194,6 +4219,23 @@ tbody tr:last-child td {
   .ping-meta {
     flex-wrap: wrap;
     gap: 10px;
+  }
+
+  .ping-meta.expanded-controls .ping-selectors {
+    width: 100%;
+    margin-left: 0;
+  }
+
+  .ping-meta.expanded-controls .ping-selectors label,
+  .ping-meta.expanded-controls .ping-selectors label:first-child {
+    width: 100%;
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  .ping-meta.expanded-controls .ping-select-drawer,
+  .ping-meta.expanded-controls .ping-selectors label:first-child .ping-select-drawer {
+    width: 100%;
+    min-width: 0;
   }
 
   .ping-series-legend {
